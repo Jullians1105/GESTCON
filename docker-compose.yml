@@ -1,0 +1,102 @@
+# Despliegue de producción — construye imágenes estáticas con `docker build`, sin hot-reload.
+# Para desarrollo local (Mac, Windows o Linux) usá docker-compose.dev.yml, no este archivo:
+# cambios en el código NO se reflejan acá hasta reconstruir manualmente las imágenes.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gestcon_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en tu archivo .env}
+      POSTGRES_DB: ${DB_NAME:-gestcon}
+    ports:
+      # Solo localhost: la base de datos no debe verse desde la red de la oficina
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gestcon_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres
+      # dianTokenService.js — perfil de Chrome PERSISTENTE (ver Dockerfile, se calienta una
+      # sola vez con una verificación real de Cloudflare, ver ESTADO_EMPRESAS_DIRECTORIO.md).
+      # Ruta dentro del contenedor; el volumen de abajo la hace sobrevivir a cada rebuild.
+      DIAN_CHROME_PROFILE_DIR: /app/dian-perfil
+      # Probado en vivo con 3 y con 5 generaciones simultaneas (ver ESTADO_EMPRESAS_DIRECTORIO.md):
+      # el CPU del servidor (2 nucleos) ya se satura igual con 3, asi que subir a 5 no lo sobrecarga
+      # mas, solo reparte los mismos nucleos entre mas solicitudes (cada una tarda ~10-15s mas).
+      DIAN_TOKEN_MAX_CONCURRENTE: '5'
+    ports:
+      # Solo localhost: el acceso de usuarios es por nginx (frontend), no directo al backend
+      - "127.0.0.1:${PORT:-3000}:3000"
+    volumes:
+      - ./backend/migrations:/app/migrations:ro
+      # dianController.js hace require('../../../shared/salaryConstants.json') y
+      # await import('.../shared/calcularNomina.js') — código compartido con el
+      # frontend que vive en la raíz del repo, fuera del build context del backend
+      # (./backend), así que la imagen nunca lo tuvo copiado adentro. La resolución
+      # relativa desde /app/src/constants/ sube 3 niveles y cae en /shared (no
+      # /app/shared) — de ahí el punto de montaje. Volumen en vez de agregarlo al
+      # Dockerfile: no exige reconstruir la imagen, solo recrear el contenedor.
+      - ./shared:/shared:ro
+      # Bind mount (no volumen nombrado) apuntando directo al perfil que YA se calentó a mano
+      # en este servidor con una verificación real de Cloudflare (ver
+      # ESTADO_EMPRESAS_DIRECTORIO.md) — un volumen nombrado empezaría vacío y se perdería ese
+      # trabajo. ${HOME} lo resuelve docker compose contra el shell que lo invoca (el usuario
+      # gestionc-server), no hace falta escribir la ruta absoluta a mano.
+      - ${HOME}/dian-perfil-real-chrome:/app/dian-perfil
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # El build de Vite (esbuild) se cae con SIGSEGV usando el /dev/shm por
+      # defecto de Docker (64MB) — probado y confirmado en el servidor de
+      # producción: con 1g el mismo build que fallaba compila limpio. No es
+      # un tema de RAM total del host ni de paralelismo, es específicamente
+      # el tamaño de /dev/shm disponible durante el build.
+      shm_size: '1gb'
+    container_name: gestcon_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /etc/nginx/certs:/etc/nginx/certs:ro
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    command: ["node", "migrations/run.js", "--seed"]
+    restart: "no"
+
+volumes:
+  postgres_data:

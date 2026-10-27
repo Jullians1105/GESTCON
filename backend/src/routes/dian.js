@@ -1,0 +1,245 @@
+const { Router } = require('express');
+const multer = require('multer');
+const { body } = require('express-validator');
+const { authMiddleware, canEdit } = require('../middleware/auth');
+const { validate } = require('../middleware/validation');
+const { uploadDian, patchBorrador, getBorrador, patchNomina, exportarBorrador, aplicarClasificacionRapida, marcarAnomaliaRevisada, TASAS_AUTORRETENCION, CLASES_IVA, CONCEPTOS } = require('../controllers/dianController');
+
+const router = Router();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel',
+    ];
+    // Algunos clientes envían octet-stream para .xlsx — lo aceptamos y dejamos que exceljs lo valide
+    if (allowed.includes(file.mimetype) || file.mimetype === 'application/octet-stream') {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se aceptan archivos Excel (.xlsx)'));
+    }
+  },
+});
+
+const handleUpload = (req, res, next) => {
+  upload.single('archivo')(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: `Error de carga: ${err.message}` });
+    }
+    if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    next();
+  });
+};
+
+router.use(authMiddleware);
+
+/**
+ * @openapi
+ * /api/dian/upload:
+ *   post:
+ *     tags: [DIAN]
+ *     summary: Cargar reporte Excel de la DIAN, calcular valores base y guardar borrador
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               archivo:
+ *                 type: string
+ *                 format: binary
+ *                 description: Archivo Excel exportado del portal DIAN
+ *               empresaId:
+ *                 type: string
+ *                 format: uuid
+ *                 nullable: true
+ *                 description: >
+ *                   Empresa del catálogo a la que pertenece este reporte. Sin empresaId el
+ *                   borrador se comporta exactamente igual que antes (sin verificación de
+ *                   NIT, sin exigir clasificación de IVA/Concepto al exportar).
+ *     responses:
+ *       201:
+ *         description: Borrador creado. Devuelve id del borrador y cálculos base.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 id:         { type: string, format: uuid }
+ *                 totalFilas: { type: integer }
+ *                 calculos:
+ *                   type: object
+ *                   properties:
+ *                     comprasBruto:         { type: number }
+ *                     devolucionCompras:    { type: number }
+ *                     ventasBruto:          { type: number }
+ *                     devolucionVentas:     { type: number }
+ *                     ivaDescontable:       { type: number }
+ *                     ivaGenerado:          { type: number }
+ *                     ivaDevolucionCompras: { type: number }
+ *                     ivaDevolucionVentas:  { type: number }
+ *       400:
+ *         description: Archivo ausente, tipo inválido, o columna requerida faltante.
+ *       401:
+ *         description: No autenticado.
+ */
+router.post('/upload',
+  canEdit,
+  handleUpload,
+  // express-validator solo puede leer req.body después de que multer lo llene — de ahí que
+  // este chequeo vaya después de handleUpload, a diferencia del resto de rutas del archivo.
+  body('empresaId').optional({ nullable: true, checkFalsy: true }).isUUID().withMessage('empresaId debe ser un UUID válido'),
+  body('confirmarEmpresa').optional().isIn(['true', 'false']),
+  validate,
+  uploadDian
+);
+
+/**
+ * @openapi
+ * /api/dian/borradores/{id}:
+ *   get:
+ *     tags: [DIAN]
+ *     summary: Recargar el estado completo del borrador (calculos, filas con clasificación persistida, nómina)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+ *     responses:
+ *       200:
+ *         description: Estado actual del borrador.
+ *       404:
+ *         description: Borrador no encontrado o no pertenece al usuario.
+ */
+router.get('/borradores/:id', getBorrador);
+
+/**
+ * @openapi
+ * /api/dian/borradores/{id}:
+ *   patch:
+ *     tags: [DIAN]
+ *     summary: Clasificar una fila del borrador (clasificacionRetencion + tasaRetencion)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [indice]
+ *             properties:
+ *               indice:                 { type: integer }
+ *               clasificacionRetencion: { type: string, nullable: true }
+ *               tasaRetencion:          { type: number, nullable: true }
+ *     responses:
+ *       200:
+ *         description: Clasificación guardada.
+ *       400:
+ *         description: indice no existe en el borrador.
+ *       404:
+ *         description: Borrador no encontrado o no pertenece al usuario.
+ */
+router.patch('/borradores/:id',
+  canEdit,
+  body('indice').notEmpty().isInt({ min: 0 }).withMessage('"indice" debe ser entero >= 0').toInt(),
+  body('clasificacionRetencion').optional({ nullable: true }).isString(),
+  body('tasaRetencion').optional({ nullable: true }).isFloat({ min: 0 }).toFloat(),
+  body('clasificacionIva').optional({ nullable: true }).isIn(CLASES_IVA),
+  body('concepto').optional({ nullable: true }).isIn(CONCEPTOS),
+  validate,
+  patchBorrador
+);
+
+router.patch('/borradores/:id/aplicar-clasificacion-rapida',
+  canEdit,
+  body('campo').optional().isIn(['clasificacionRetencion', 'clasificacionIva', 'concepto']),
+  body('clasificacionRetencion').optional({ nullable: true }).isString(),
+  body('clasificacionIva').optional({ nullable: true }).isIn(CLASES_IVA),
+  body('concepto').optional({ nullable: true }).isIn(CONCEPTOS),
+  body('tasaRetencion').optional({ nullable: true }).isFloat({ min: 0 }).toFloat(),
+  validate,
+  aplicarClasificacionRapida
+);
+
+/**
+ * @openapi
+ * /api/dian/borradores/{id}/nomina:
+ *   patch:
+ *     tags: [DIAN]
+ *     summary: Autoguardar los inputs del formulario de Nómina (se pisan completos en cada llamada)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+ *     responses:
+ *       200:
+ *         description: Nómina guardada.
+ *       404:
+ *         description: Borrador no encontrado o no pertenece al usuario.
+ */
+router.patch('/borradores/:id/nomina',
+  canEdit,
+  body('empleados').optional({ nullable: true }).isInt({ min: 0 }).toInt(),
+  body('meses').optional({ nullable: true }).isInt({ min: 0 }).toInt(),
+  body('salario').optional({ nullable: true }).isFloat({ min: 0 }).toFloat(),
+  body('tarifaArl').optional({ nullable: true }).isFloat({ min: 0 }).toFloat(),
+  body('tasaAutorretencion').optional({ nullable: true }).isIn(TASAS_AUTORRETENCION),
+  validate,
+  patchNomina
+);
+
+/**
+ * @openapi
+ * /api/dian/borradores/{id}/revisar-anomalia:
+ *   patch:
+ *     tags: [DIAN]
+ *     summary: Marca un tipo de anomalía como revisado manualmente (solo ack de auditoría — nunca cambia ningún cálculo)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [tipo]
+ *             properties:
+ *               tipo: { type: string, description: 'Debe coincidir exactamente con el "tipo" de la anomalía detectada' }
+ *     responses:
+ *       200:
+ *         description: Anomalía marcada como revisada.
+ *       400:
+ *         description: '"tipo" ausente.'
+ *       404:
+ *         description: Borrador no encontrado o no pertenece al usuario.
+ */
+router.patch('/borradores/:id/revisar-anomalia',
+  canEdit,
+  body('tipo').notEmpty().isString(),
+  validate,
+  marcarAnomaliaRevisada
+);
+
+router.post('/borradores/:id/exportar',
+  body('empleados').optional({ nullable: true }).isInt({ min: 0 }).toInt(),
+  body('meses').optional({ nullable: true }).isInt({ min: 0 }).toInt(),
+  body('salario').optional({ nullable: true }).isFloat({ min: 0 }).toFloat(),
+  body('tasaAutorretencion').optional({ nullable: true }).isIn(TASAS_AUTORRETENCION),
+  body('modo').optional({ nullable: true }).isIn(['actualizar', 'reemplazar']),
+  validate,
+  exportarBorrador
+);
+
+module.exports = router;

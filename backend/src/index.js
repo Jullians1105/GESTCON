@@ -1,0 +1,219 @@
+require('dotenv').config();
+const http = require('http');
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { Server } = require('socket.io');
+const swaggerJsdoc = require('swagger-jsdoc');
+const swaggerUi = require('swagger-ui-express');
+
+const env = require('./config/env');
+const logger = require('./utils/logger');
+const { verify } = require('./utils/jwt');
+const { clientIp } = require('./utils/clientIp');
+const { validateProductionEnv } = require('./middleware/security');
+const { setupSocket } = require('./socket/events');
+const { errorHandler, notFound } = require('./middleware/errorHandler');
+
+validateProductionEnv();
+
+const authRoutes = require('./routes/auth');
+const taskRoutes = require('./routes/tasks');
+const personalTaskRoutes = require('./routes/personalTasks');
+const personalNoteRoutes = require('./routes/personalNotes');
+const employeeRoutes = require('./routes/employees');
+const groupRoutes = require('./routes/groups');
+const tagRoutes = require('./routes/tags');
+const statsRoutes = require('./routes/stats');
+const actividadRoutes = require('./routes/actividad');
+const notificationRoutes = require('./routes/notifications');
+const fondoEmpresasRoutes   = require('./routes/fondoEmpresas');
+const fondoProcesosRoutes   = require('./routes/fondoProcesos');
+const fondoProcesoGruposRoutes = require('./routes/fondoProcesoGrupos');
+const fondoChecklistRoutes  = require('./routes/fondoChecklist');
+const fondoDetalleRoutes    = require('./routes/fondoDetalle');
+const fondoImpuestosRoutes  = require('./routes/fondoImpuestos');
+const fondoPagosRoutes      = require('./routes/fondoPagos');
+const fondoLinksRoutes      = require('./routes/fondoLinks');
+const dianRoutes            = require('./routes/dian');
+const dianDeudasRoutes      = require('./routes/dianDeudas');
+const acusesRoutes          = require('./routes/acuses');
+const contabEmpresasRoutes  = require('./routes/contabEmpresas');
+const empresasMaestroRoutes = require('./routes/empresasMaestro');
+const contabConsolidadoRoutes = require('./routes/contabConsolidado');
+const exogenasRoutes        = require('./routes/exogenas');
+const tercerosRoutes        = require('./routes/terceros');
+const extEmpresasRoutes     = require('./routes/extEmpresas');
+const extProcesosRoutes     = require('./routes/extProcesos');
+const extProcesoGruposRoutes = require('./routes/extProcesoGrupos');
+const extChecklistRoutes    = require('./routes/extChecklist');
+const neEmpresasRoutes      = require('./routes/nominaElectronicaEmpresas');
+const neMesesRoutes         = require('./routes/nominaElectronicaMeses');
+const nePlazoRoutes         = require('./routes/nominaElectronicaPlazo');
+
+const app = express();
+const server = http.createServer(app);
+
+// Confiar en el proxy reverso (nginx) para que express-rate-limit lea X-Forwarded-For correctamente
+app.set('trust proxy', 1);
+
+// En desarrollo permite cualquier puerto de localhost (Vite puede usar 5173, 5174, etc.)
+const corsOrigin = env.NODE_ENV === 'development'
+  ? /^http:\/\/localhost(:\d+)?$/
+  : env.CLIENT_URL.split(',').map(u => u.trim()).filter(Boolean);
+
+// Socket.io
+const io = new Server(server, {
+  cors: { origin: corsOrigin, credentials: true },
+});
+setupSocket(io);
+// Los cron no se arrancan en tests: dejan temporizadores vivos (Jest no termina
+// solo) y limpiarBorradoresVencidos() corre al arrancar contra la BD de las pruebas.
+if (env.NODE_ENV !== 'test') {
+  const { initRecurringCron } = require('./services/recurringTaskService');
+  initRecurringCron(io);
+  const { initReminderCron } = require('./services/reminderService');
+  initReminderCron(io);
+  const { initNEPlazoCron } = require('./services/nePlazoReminderService');
+  initNEPlazoCron(io);
+  const { initBorradorCleanupCron } = require('./services/borradorCleanupService');
+  initBorradorCleanupCron();
+  const { initEmpresasRuesCron } = require('./services/empresasRuesService');
+  initEmpresasRuesCron();
+}
+
+// Inyectar io en todas las requests
+app.use((req, _res, next) => { req.io = io; next(); });
+
+// Security middlewares
+app.use(helmet({ contentSecurityPolicy: env.NODE_ENV === 'production' }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting
+// Se identifica por usuario (del JWT) en vez de por IP: varias personas de la
+// misma oficina salen a internet con la misma IP pública, y contarlas juntas
+// contra un único cupo hacía que 429 apareciera con tráfico normal de equipo.
+const keyByUserOrIp = (req) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const { userId } = verify(authHeader.slice(7));
+      if (userId) return `user:${userId}`;
+    } catch {
+      // token inválido/expirado — se cuenta por IP como fallback
+    }
+  }
+  return clientIp(req);
+};
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 2000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes, intenta más tarde' },
+  keyGenerator: keyByUserOrIp,
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  message: { error: 'Demasiados intentos de login' },
+});
+app.use('/api/', limiter);
+app.use('/api/auth/login', authLimiter);
+
+// Swagger — solo en desarrollo (A05: no exponer docs en producción)
+if (env.NODE_ENV !== 'production') {
+const swaggerSpec = swaggerJsdoc({
+  definition: {
+    openapi: '3.0.0',
+    info: { title: 'Gestor de Tareas API', version: '3.0.0', description: 'API REST para gestión de tareas empresarial' },
+    servers: [{ url: `http://localhost:${env.PORT}`, description: 'Desarrollo' }],
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+      },
+      schemas: {
+        TaskInput: {
+          type: 'object',
+          required: ['title'],
+          properties: {
+            title: { type: 'string', maxLength: 255 },
+            description: { type: 'string' },
+            priority: { type: 'string', enum: ['high', 'medium', 'low'] },
+            assignedTo: { type: 'string', format: 'uuid' },
+            dueDate: { type: 'string', format: 'date' },
+            groupId: { type: 'string', format: 'uuid' },
+            tagIds: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+  },
+  apis: ['./src/routes/*.js'],
+});
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+} // end swagger dev-only block
+
+// Health check
+app.get('/api/health', (_req, res) => res.json({ status: 'OK', timestamp: new Date().toISOString() }));
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/tasks', taskRoutes);
+app.use('/api/personal-tasks', personalTaskRoutes);
+app.use('/api/personal-notes', personalNoteRoutes);
+app.use('/api/employees', employeeRoutes);
+app.use('/api/groups', groupRoutes);
+app.use('/api/tags', tagRoutes);
+app.use('/api/stats', statsRoutes);
+app.use('/api/actividad', actividadRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/fondo/empresas',   fondoEmpresasRoutes);
+app.use('/api/fondo/procesos',   fondoProcesosRoutes);
+app.use('/api/fondo/proceso-grupos', fondoProcesoGruposRoutes);
+app.use('/api/fondo/checklist',  fondoChecklistRoutes);
+app.use('/api/fondo/detalle',    fondoDetalleRoutes);
+app.use('/api/fondo/impuestos',  fondoImpuestosRoutes);
+app.use('/api/fondo/pagos',      fondoPagosRoutes);
+app.use('/api/tasks',            fondoLinksRoutes);
+app.use('/api/externas/empresas',  extEmpresasRoutes);
+app.use('/api/externas/procesos',  extProcesosRoutes);
+app.use('/api/externas/proceso-grupos', extProcesoGruposRoutes);
+app.use('/api/externas/checklist', extChecklistRoutes);
+app.use('/api/nomina-electronica/empresas', neEmpresasRoutes);
+app.use('/api/nomina-electronica/meses',    neMesesRoutes);
+app.use('/api/nomina-electronica/plazo',    nePlazoRoutes);
+app.use('/api/dian',             dianRoutes);
+app.use('/api/dian-deudas',      dianDeudasRoutes);
+app.use('/api/acuses',           acusesRoutes);
+app.use('/api/contabilidad/empresas', contabEmpresasRoutes);
+app.use('/api/contabilidad', contabConsolidadoRoutes);
+app.use('/api/empresas', empresasMaestroRoutes);
+app.use('/api/exogenas',         exogenasRoutes);
+app.use('/api/terceros',         tercerosRoutes);
+
+// Frontend is served by nginx in production — this block only runs locally
+if (env.NODE_ENV === 'development') {
+  const path = require('path');
+  const distPath = path.join(__dirname, '../../dist');
+  if (require('fs').existsSync(distPath)) {
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  }
+}
+
+app.use(notFound);
+app.use(errorHandler);
+
+if (env.NODE_ENV !== 'test') {
+  server.listen(env.PORT, () => {
+    logger.info(`Gestor de Tareas backend v3.0 corriendo en http://localhost:${env.PORT}`);
+    logger.info(`Docs: http://localhost:${env.PORT}/api/docs`);
+    logger.info(`Ambiente: ${env.NODE_ENV}`);
+  });
+}
+
+module.exports = { app, server, io };

@@ -1,0 +1,741 @@
+import { useState, useRef, useCallback, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import StatsCard from '../components/StatsCard'
+import EmpresaCombobox from '../components/EmpresaCombobox'
+import { api } from '../services/api'
+import Cargando from '../components/Cargando'
+
+const VALID_EXTS  = ['.xlsx', '.xls']
+const VALID_MIMES = [
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+]
+
+function isValidFile(file) {
+  if (!file) return false
+  const name = file.name.toLowerCase()
+  const extOk  = VALID_EXTS.some((e) => name.endsWith(e))
+  const mimeOk = !file.type || VALID_MIMES.includes(file.type) || file.type === 'application/octet-stream'
+  return extOk && mimeOk
+}
+
+const formatoMoneda = (n) =>
+  `$ ${Number(n ?? 0).toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+// Los 4 formatos generan Excel — 1001 y 1007 dejan algunas columnas en blanco cuando falta una
+// regla de negocio por definir con el usuario (ver CONFIG_FORMATO#aviso de cada uno, y
+// formato1001.js/formato1007.js en el backend).
+const FORMATOS_DISPONIBLES = [
+  { id: '1001', codigo: '1001', nombre: 'Gastos/Compras', icon: 'payments', disponible: true },
+  { id: '1005', codigo: '1005', nombre: 'Impuestos descontables', icon: 'receipt_long', disponible: true },
+  { id: '1006', codigo: '1006', nombre: 'IVA/Inc generado', icon: 'sell', disponible: true },
+  { id: '1007', codigo: '1007', nombre: 'Ingresos', icon: 'trending_up', disponible: true },
+]
+
+// Hoja obligatoria del TOKEN y campos monetarios de salida por formato — usado para adaptar
+// hints y la tabla de vista previa sin acoplar el resto de la página a un formato específico.
+// `aviso` (opcional): banner informativo mostrado arriba de las tarjetas, para formatos que
+// generan Excel con algo todavía pendiente de definir. `columnasExtra` (opcional): columnas
+// adicionales en la tabla, entre DV y los campos monetarios, cada una con su propio render por
+// fila — hoy las usan 1001 (Dirección/Estado del tercero) y 1007 (país del tercero).
+// Clases completas y literales por color (no interpoladas) — Tailwind escanea el código fuente
+// buscando nombres de clase tal cual aparecen, así que `bg-${color}-100` no generaría el CSS.
+const BADGE_ESTILOS = {
+  green: 'text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-green-100 text-green-700',
+  amber: 'text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700',
+  red: 'text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-red-100 text-red-700',
+}
+const badge = (color, texto) => <span className={BADGE_ESTILOS[color]}>{texto}</span>
+const CONFIG_FORMATO = {
+  '1001': {
+    hojaToken: 'COMPRAS',
+    aviso: 'CPT (Concepto) y PAGO salen de lo ya clasificado en Contabilidad para la empresa/año elegidos — si un tercero no tiene compras clasificadas ahí, esas dos columnas quedan vacías para él. El resto de columnas de dinero (PNDED, IDED, INDED, RETP, RETA, COMUN, NDOM) por el momento se calculan de forma manual — quedan vacías en el Excel, complétalas aparte. La dirección/DPTO/MUN/PAIS se toman de los terceros ya guardados en "Importar Terceros"; si un tercero no está ahí, esas también quedan vacías.',
+    campos: [
+      { key: 'pago', totalKey: 'totalPago', label: 'PAGO', statTitle: 'Total pagado', statSub: 'Suma de la Base clasificada en Contabilidad' },
+    ],
+    columnasExtra: [
+      { label: 'CPT (Concepto)', width: 'w-32', render: (r) => r.concepto || '—' },
+      { label: 'Dirección', width: 'w-40', render: (r) => r.direccion || '—' },
+      {
+        label: 'Estado',
+        width: 'w-24',
+        render: (r) => (
+          r.tieneDatosCompletos ? badge('green', 'Completo')
+            : r.tieneTercero ? badge('amber', 'Incompleto')
+            : badge('red', 'Sin factura')
+        ),
+      },
+    ],
+  },
+  '1005': {
+    hojaToken: 'COMPRAS',
+    campos: [
+      { key: 'vimp', totalKey: 'totalVimp', label: 'VIMP', statTitle: 'Total IVA descontable', statSub: 'VIMP acumulado de todos los terceros' },
+      { key: 'ivade', totalKey: 'totalIvade', label: 'IVADE', statTitle: 'Total IVA devoluciones ventas', statSub: 'IVADE acumulado de todos los terceros' },
+    ],
+  },
+  '1006': {
+    hojaToken: 'VENTAS',
+    campos: [
+      { key: 'imp', totalKey: 'totalImp', label: 'IMP', statTitle: 'Total IVA generado', statSub: 'IMP acumulado de todos los terceros' },
+      { key: 'iva', totalKey: 'totalIva', label: 'IVA', statTitle: 'Total IVA devoluciones compras', statSub: 'IVA acumulado de todos los terceros' },
+      { key: 'icon', totalKey: 'totalIcon', label: 'ICON', statTitle: 'Total INC generado', statSub: 'ICON acumulado de todos los terceros' },
+    ],
+  },
+  '1007': {
+    hojaToken: 'VENTAS',
+    aviso: 'El concepto (CPT) por el momento se coloca de forma manual — queda vacío en el Excel generado, complétalo aparte. El país (PAIS) se toma de los terceros ya guardados en "Importar Terceros"; si un cliente no está ahí, también queda vacío. Antes de generar cada exógena, sube las facturas de los clientes de este TOKEN para completarlo.',
+    campos: [
+      { key: 'ibru', totalKey: 'totalIbru', label: 'IBRU', statTitle: 'Total ingresos brutos', statSub: 'IBRU acumulado de todos los terceros' },
+      { key: 'dev', totalKey: 'totalDev', label: 'DEV', statTitle: 'Total devoluciones', statSub: 'DEV acumulado de todos los terceros' },
+    ],
+    columnasExtra: [
+      {
+        label: 'PAIS',
+        width: 'w-24',
+        render: (r) => (r.tienePais ? badge('green', r.pais || r.codigoPaisDian) : badge('amber', 'Sin país')),
+      },
+    ],
+  },
+}
+const STAT_COLORS = ['#16a34a', '#004ac6', '#d97706']
+
+function FormatoCard({ formato, checked, onToggle }) {
+  const { nombre, codigo, icon, disponible } = formato
+
+  const base = 'relative flex flex-col items-start gap-2 rounded-2xl border-2 transition-all duration-150 px-4 py-4 text-left'
+  const style = !disponible
+    ? `${base} border-dashed border-[#e2e4ef] opacity-50 cursor-not-allowed`
+    : checked
+      ? `${base} border-solid border-[#003B43] bg-[#003B43]/10 cursor-pointer`
+      : `${base} border-dashed border-[#c3c6d7] bg-white hover:border-[#003B43] hover:bg-[#E3EEEE] cursor-pointer`
+
+  return (
+    <div
+      className={style}
+      onClick={() => disponible && onToggle(formato.id)}
+      role="checkbox"
+      aria-checked={checked}
+      aria-disabled={!disponible}
+      tabIndex={disponible ? 0 : -1}
+      onKeyDown={(e) => { if (disponible && e.key === 'Enter') onToggle(formato.id) }}
+    >
+      {disponible ? (
+        <span
+          className="absolute top-3 right-3 material-symbols-outlined text-lg"
+          style={{ color: checked ? '#003B43' : '#c3c6d7' }}
+        >
+          {checked ? 'check_circle' : 'radio_button_unchecked'}
+        </span>
+      ) : (
+        <span className="absolute top-3 right-3 text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-[#f0f2f8] text-[#8890b5]">
+          Próximamente
+        </span>
+      )}
+      <span className="material-symbols-outlined text-2xl" style={{ color: !disponible ? '#9ca3af' : '#003B43' }}>
+        {icon}
+      </span>
+      <div>
+        <p className="text-sm font-bold text-[#191c1e]">{codigo}</p>
+        <p className="text-xs text-[#6b7280]">{nombre}</p>
+      </div>
+    </div>
+  )
+}
+
+function Dropzone({ label, hint, icon, file, onFile, onClear }) {
+  const inputRef = useRef(null)
+  const [isDragOver, setIsDragOver] = useState(false)
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault()
+    setIsDragOver(false)
+    const f = e.dataTransfer.files?.[0]
+    if (f) onFile(f)
+  }, [onFile])
+
+  const onChange = useCallback((e) => {
+    const f = e.target.files?.[0]
+    if (f) onFile(f)
+    e.target.value = ''
+  }, [onFile])
+
+  const base = 'group relative flex flex-col items-center justify-center gap-2 rounded-2xl border-2 transition-all duration-150 cursor-pointer select-none px-4 py-8 text-center overflow-hidden'
+  const style = file
+    ? `${base} border-solid border-[#16a34a] bg-[#f0fdf4]`
+    : isDragOver
+      ? `${base} border-[#003B43] bg-[#003B43]/10 border-solid`
+      : `${base} border-dashed border-[#c3c6d7] bg-[#f8f9fc] hover:border-[#003B43] hover:bg-[#E3EEEE]`
+
+  return (
+    <div
+      className={style}
+      onDragOver={(e) => { e.preventDefault(); setIsDragOver(true) }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setIsDragOver(false) }}
+      onDrop={onDrop}
+      onClick={() => inputRef.current?.click()}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => e.key === 'Enter' && inputRef.current?.click()}
+    >
+      <input ref={inputRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={onChange} />
+      {file && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onClear() }}
+          aria-label={`Quitar ${label}`}
+          title="Quitar archivo"
+          className="absolute top-2.5 right-2.5 z-10 flex items-center justify-center w-6 h-6 rounded-full bg-white border border-[#d1d5db] text-[#6b7280] hover:bg-red-50 hover:border-red-300 hover:text-red-600 transition"
+        >
+          <span className="material-symbols-outlined text-sm">close</span>
+        </button>
+      )}
+      <span className="material-symbols-outlined text-3xl" style={{ color: file ? '#16a34a' : '#003B43' }}>
+        {file ? 'check_circle' : icon}
+      </span>
+      <p className="text-sm font-semibold text-[#434655]">{label}</p>
+      <p className="text-xs text-[#9ca3af] truncate max-w-full">
+        {file ? file.name : hint}
+      </p>
+      {file && (
+        <div className="absolute -inset-0.5 flex items-center justify-center gap-1.5 rounded-2xl bg-[#0f2418]/80 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+          <span className="material-symbols-outlined text-base text-white">sync_alt</span>
+          <p className="text-xs font-semibold text-white">Clic para cambiar el archivo</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function ExogenasUploadPage() {
+  // Si la URL ya trae ids de borradores al montar, arranca en 'restaurando' (no 'idle') para
+  // que el formulario de carga nunca llegue a pintarse mientras se piden los datos — si
+  // arrancara en 'idle', se vería un parpadeo del formulario antes de que el efecto de abajo
+  // termine de restaurar la vista previa.
+  const [estado, setEstado] = useState(
+    () => (new URLSearchParams(window.location.search).get('b') ? 'restaurando' : 'idle')
+  ) // idle | restaurando | analizando | preview | error
+  const [errorMsg, setErrorMsg] = useState('')
+  const [formatos, setFormatos]           = useState(['1005'])
+  const [tokenFile, setTokenFile]         = useState(null)
+  const [plantillaFile, setPlantillaFile] = useState(null)
+
+  // Solo para el 1001: a qué empresa de Contabilidad y a qué año corresponde este reporte —
+  // se necesita para más adelante ir a buscar en `contab_documentos` el Concepto y la Base ya
+  // clasificados por factura (ver ESTADO_EXOGENAS_1001_1007.md). El TOKEN no trae esa
+  // clasificación, así que sin esto no hay cómo saber de dónde traerla.
+  const [contabEmpresas, setContabEmpresas] = useState([])
+  const [contabEmpresaId, setContabEmpresaId] = useState('')
+  const [anioExogena, setAnioExogena] = useState(new Date().getFullYear())
+
+  useEffect(() => {
+    api.getContabEmpresas().then(setContabEmpresas).catch(() => {})
+  }, [])
+  // Un borrador por formato analizado — el backend procesa un formato a la vez, así que
+  // "Analizar" llama el endpoint una vez por cada formato marcado y guarda cada resultado acá,
+  // indexado por formato, para poder cambiar de pestaña sin volver a subir los archivos.
+  const [borradores, setBorradores] = useState({}) // { [formato]: { id, totalTerceros, ..., registros } }
+  const [tabActivo, setTabActivo]   = useState(null) // solo controla qué pestaña se PREVISUALIZA
+  const [generando, setGenerando]   = useState(false)
+  // Un solo botón "Generar Excel" para TODOS los formatos analizados juntos — el backend arma
+  // un solo archivo con la hoja de cada formato ya llena. Blob guardado en memoria para poder
+  // re-disparar la descarga sin volver a pedirle el archivo al servidor — los borradores se
+  // borran del servidor apenas se genera con éxito (mismo patrón que Contabilidad DIAN).
+  const [descargaCombinada, setDescargaCombinada] = useState(null) // { blob, filename }
+
+  // El id de cada borrador vive en la URL (?b=1005:<uuid>,1006:<uuid>) — al recargar la página,
+  // el efecto de abajo los recupera del backend (mismo endpoint que ya usa Contabilidad DIAN
+  // para esto). No hay que guardar los registros en localStorage: siempre se piden frescos al
+  // servidor, así que nunca queda una copia vieja/desactualizada dando vueltas en el navegador,
+  // y solo es un GET liviano por formato (igual de rápido que abrir la página de cero).
+  const [searchParams, setSearchParams] = useSearchParams()
+  const toggleFormato = useCallback((id) => {
+    setFormatos((prev) => (prev.includes(id) ? prev.filter((f) => f !== id) : [...prev, id]))
+  }, [])
+
+  // Cambiar o quitar un archivo limpia el error de un intento fallido anterior — si no, el
+  // usuario ve el mensaje de "archivo inválido" pegado aunque ya haya corregido el archivo.
+  const limpiarErrorSiHabia = useCallback(() => {
+    setEstado((prev) => (prev === 'error' ? 'idle' : prev))
+    setErrorMsg('')
+  }, [])
+
+  const onTokenFile = useCallback((f) => { setTokenFile(f); limpiarErrorSiHabia() }, [limpiarErrorSiHabia])
+  const onPlantillaFile = useCallback((f) => { setPlantillaFile(f); limpiarErrorSiHabia() }, [limpiarErrorSiHabia])
+  const limpiarToken = useCallback(() => { setTokenFile(null); limpiarErrorSiHabia() }, [limpiarErrorSiHabia])
+  const limpiarPlantilla = useCallback(() => { setPlantillaFile(null); limpiarErrorSiHabia() }, [limpiarErrorSiHabia])
+
+  const dispararDescarga = useCallback((blob, filename) => {
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.URL.revokeObjectURL(url)
+  }, [])
+
+  // Escribe los ids de los borradores vivos en la URL (?b=1005:<uuid>,1006:<uuid>). Un mapa
+  // vacío limpia el parámetro por completo.
+  const actualizarUrlBorradores = useCallback((mapaBorradores) => {
+    const pares = Object.entries(mapaBorradores).map(([formato, b]) => `${formato}:${b.id}`)
+    setSearchParams(pares.length > 0 ? { b: pares.join(',') } : {}, { replace: true })
+  }, [setSearchParams])
+
+  // Al montar (o al recargar la página), si la URL trae ids de borradores se piden frescos al
+  // servidor — nunca se guarda el contenido en el navegador, solo el id. Si alguno ya expiró o
+  // ya se generó (y por eso se borró en el servidor), simplemente se descarta sin romper el
+  // resto; si no queda ninguno vivo, la URL se limpia y la página vuelve a "idle" con el ✕.
+  useEffect(() => {
+    const param = searchParams.get('b')
+    if (!param) return
+
+    let cancelado = false
+    ;(async () => {
+      const pares = param.split(',').map((p) => p.split(':')).filter(([, id]) => id)
+      const resultados = await Promise.all(
+        pares.map(([, id]) => api.getExogenasBorrador(id).catch(() => null))
+      )
+      if (cancelado) return
+
+      const recuperados = {}
+      resultados.forEach((data) => { if (data) recuperados[data.formato] = data })
+
+      if (recuperados['1001']?.opciones?.contabEmpresaId) {
+        setContabEmpresaId(recuperados['1001'].opciones.contabEmpresaId)
+        setAnioExogena(recuperados['1001'].opciones.anio)
+      }
+
+      if (Object.keys(recuperados).length > 0) {
+        setBorradores(recuperados)
+        setTabActivo(Object.keys(recuperados)[0])
+        setFormatos(Object.keys(recuperados))
+        setEstado('preview')
+      } else {
+        setEstado('idle')
+      }
+      actualizarUrlBorradores(recuperados)
+    })()
+
+    return () => { cancelado = true }
+    // Solo al montar — la URL se actualiza desde analizar/generar/reiniciar, no al revés.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const analizar = useCallback(async () => {
+    if (formatos.length === 0) {
+      setEstado('error')
+      setErrorMsg('Marca al menos un formato para generar')
+      return
+    }
+    if (!isValidFile(tokenFile) || !isValidFile(plantillaFile)) {
+      setEstado('error')
+      setErrorMsg('Selecciona ambos archivos en formato Excel (.xlsx, .xls)')
+      return
+    }
+    if (formatos.includes('1001') && (!contabEmpresaId || !anioExogena)) {
+      setEstado('error')
+      setErrorMsg('Selecciona la empresa (de Contabilidad) y el año para el 1001')
+      return
+    }
+    setEstado('analizando')
+    setErrorMsg('')
+
+    // Un formato a la vez (limitación actual del backend) — se analizan todos los marcados en
+    // secuencia y se guardan por separado; si alguno falla se corta ahí y no se pierde el
+    // mensaje de cuál formato fue.
+    const nuevosBorradores = {}
+    try {
+      for (const formatoId of formatos) {
+        const formData = new FormData()
+        formData.append('formato', formatoId)
+        formData.append('token', tokenFile)
+        formData.append('plantilla', plantillaFile)
+        if (formatoId === '1001') {
+          formData.append('contabEmpresaId', contabEmpresaId)
+          formData.append('anio', String(anioExogena))
+        }
+        nuevosBorradores[formatoId] = await api.uploadExogenas(formData)
+      }
+      setBorradores(nuevosBorradores)
+      setTabActivo(formatos[0])
+      setEstado('preview')
+      actualizarUrlBorradores(nuevosBorradores)
+    } catch (err) {
+      setEstado('error')
+      setErrorMsg(err.message || 'Error al procesar los archivos')
+    }
+  }, [formatos, tokenFile, plantillaFile, contabEmpresaId, anioExogena, actualizarUrlBorradores])
+
+  // Un solo Excel con todos los formatos analizados, cada uno en su propia hoja — no depende
+  // de cuál pestaña esté activa, esa solo controla qué se está previsualizando.
+  const generar = useCallback(async () => {
+    const ids = Object.values(borradores).map((b) => b.id)
+    if (ids.length === 0) return
+    setGenerando(true)
+    setErrorMsg('')
+    try {
+      const { blob, filename } = await api.generarExogenasCombinado(ids)
+      dispararDescarga(blob, filename)
+      setDescargaCombinada({ blob, filename })
+      // Los borradores ya no existen en el servidor una vez generados — se limpia la URL para
+      // que un reload no intente recargar ids que ya no sirven.
+      actualizarUrlBorradores({})
+    } catch (err) {
+      setErrorMsg(err.message || 'Error al generar el Excel')
+    } finally {
+      setGenerando(false)
+    }
+  }, [borradores, dispararDescarga, actualizarUrlBorradores])
+
+  // Re-descarga sin volver a pedirle el archivo al servidor (los borradores ya no existen ahí).
+  const descargarDeNuevo = useCallback(() => {
+    if (!descargaCombinada) return
+    dispararDescarga(descargaCombinada.blob, descargaCombinada.filename)
+  }, [descargaCombinada, dispararDescarga])
+
+  const reiniciar = useCallback(() => {
+    setEstado('idle')
+    setErrorMsg('')
+    setFormatos(['1005'])
+    setTokenFile(null)
+    setPlantillaFile(null)
+    setBorradores({})
+    setTabActivo(null)
+    setDescargaCombinada(null)
+    setContabEmpresaId('')
+    actualizarUrlBorradores({})
+  }, [actualizarUrlBorradores])
+
+  const puedeAnalizar = formatos.length > 0 && tokenFile && plantillaFile && estado !== 'analizando'
+    && (!formatos.includes('1001') || (contabEmpresaId && anioExogena))
+  const borrador = borradores[tabActivo] ?? null
+  const camposFormato = CONFIG_FORMATO[tabActivo]?.campos ?? []
+  const avisoFormato = CONFIG_FORMATO[tabActivo]?.aviso ?? null
+  const columnasExtra = CONFIG_FORMATO[tabActivo]?.columnasExtra ?? []
+  // Pestañas: formatos ya analizados (con datos) + los que aún no están implementados, siempre
+  // visibles como "Próximamente" al final — así el usuario ve hacia dónde va creciendo esto.
+  const tabsFormato = FORMATOS_DISPONIBLES.filter((f) => (f.disponible ? Boolean(borradores[f.id]) : true))
+  // Con 1-2 formatos el botón muestra los códigos (informativo y corto); con más, un conteo —
+  // "Generar Excel 1001, 1005, 1006, 1007" ya no cabe cómodo ni aporta más que el número.
+  const formatosAnalizados = Object.keys(borradores).sort()
+  const etiquetaGenerar = formatosAnalizados.length <= 2
+    ? `Generar Excel ${formatosAnalizados.join(', ')}`
+    : `Generar Excel (${formatosAnalizados.length} formatos)`
+
+  return (
+    <div className="max-w-[1100px] mx-auto mt-8 mb-16">
+      {/* Encabezado */}
+      <div className="mb-8">
+        <div className="flex items-center gap-3 mb-2">
+          <span className="material-symbols-outlined text-3xl text-[#003B43]">request_quote</span>
+          <h1 className="text-2xl font-bold text-[#191c1e]">Exógenas</h1>
+        </div>
+        <p className="text-sm text-[#6b7280]">
+          Marca los formatos que necesitas, sube el TOKEN y la plantilla SIIGO, y genera el reporte.
+        </p>
+      </div>
+
+      {estado === 'restaurando' && (
+        <Cargando texto="Recuperando tu último análisis…" className="py-24" />
+      )}
+
+      {(estado === 'idle' || estado === 'analizando' || estado === 'error') && (
+        <div className="bg-white rounded-2xl border border-[#e2e4ef] shadow-sm p-6 mb-4">
+          <h2 className="text-sm font-bold text-[#191c1e] mb-1">¿Qué formatos deseas generar?</h2>
+          <p className="text-xs text-[#9ca3af] mb-4">
+            No toda empresa necesita los 4 — marca solo los que apliquen. El archivo final trae todos los marcados en una sola plantilla.
+          </p>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {FORMATOS_DISPONIBLES.map((f) => (
+              <FormatoCard key={f.id} formato={f} checked={formatos.includes(f.id)} onToggle={toggleFormato} />
+            ))}
+          </div>
+
+          {/* Solo para el 1001 — a qué empresa/año corresponde, para poder cruzar más adelante
+              con el Concepto ya clasificado en Contabilidad (ver ESTADO_EXOGENAS_1001_1007.md). */}
+          {formatos.includes('1001') && (
+            <div className="mt-4 pt-4 border-t border-[#f0f2f8] flex flex-col sm:flex-row gap-4">
+              <div className="flex-1">
+                <label className="block text-xs font-semibold text-[#434655] mb-1.5">
+                  Empresa (Contabilidad) — para el 1001
+                </label>
+                <EmpresaCombobox empresas={contabEmpresas} value={contabEmpresaId} onChange={setContabEmpresaId} />
+              </div>
+              <div className="w-full sm:w-32">
+                <label className="block text-xs font-semibold text-[#434655] mb-1.5">Año</label>
+                <input
+                  type="number"
+                  value={anioExogena}
+                  onChange={(e) => setAnioExogena(parseInt(e.target.value, 10) || '')}
+                  className="w-full px-3 py-2.5 rounded-xl border border-[#d1d5db] bg-white text-sm text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#E5A70C]/30"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {(estado === 'idle' || estado === 'analizando' || estado === 'error') && (
+        <div className="bg-white rounded-2xl border border-[#e2e4ef] shadow-sm p-8">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Dropzone
+              label="TOKEN (detalle de compras/ventas)"
+              hint={(() => {
+                // Dedupe: dos formatos pueden compartir hoja (ej. 1006 y 1007 leen VENTAS) — sin
+                // esto el hint diría "hoja VENTAS y VENTAS".
+                const hojas = [...new Set(formatos.map((f) => CONFIG_FORMATO[f]?.hojaToken).filter(Boolean))]
+                return `Debe traer la${hojas.length > 1 ? 's' : ''} hoja${hojas.length > 1 ? 's' : ''} ${hojas.join(' y ') || 'correspondiente'} ya validada${hojas.length > 1 ? 's' : ''}`
+              })()}
+              icon="upload_file"
+              file={tokenFile}
+              onFile={onTokenFile}
+              onClear={limpiarToken}
+            />
+            <Dropzone
+              label="Plantilla SIIGO"
+              hint={`Formato${formatos.length > 1 ? 's' : ''} ${formatos.join(', ') || ''} oficial`}
+              icon="description"
+              file={plantillaFile}
+              onFile={onPlantillaFile}
+              onClear={limpiarPlantilla}
+            />
+          </div>
+
+          {estado === 'error' && errorMsg && (
+            <div className="mt-5 flex items-start gap-3 p-4 rounded-xl bg-red-50 border border-red-200">
+              <span className="material-symbols-outlined text-red-500 text-xl flex-shrink-0 mt-0.5">error</span>
+              <p className="text-sm font-semibold text-red-700">{errorMsg}</p>
+            </div>
+          )}
+
+          <div className="mt-6 flex justify-center">
+            <button
+              onClick={analizar}
+              disabled={!puedeAnalizar}
+              className="flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{ background: '#003B43' }}
+            >
+              {estado === 'analizando' ? (
+                <>
+                  <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-30" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                    <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                  </svg>
+                  Analizando…
+                </>
+              ) : (
+                <>
+                  <span className="material-symbols-outlined text-base">analytics</span>
+                  Analizar y previsualizar
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {estado === 'preview' && borrador && (
+        <div>
+          <div className="flex items-center gap-2 mb-6 flex-wrap">
+            {tabsFormato.map((f) => {
+              const tieneDatos = Boolean(borradores[f.id])
+              if (!tieneDatos) {
+                return (
+                  <span
+                    key={f.id}
+                    className="flex items-center gap-1.5 pl-2.5 pr-3 py-2 rounded-xl border-2 border-dashed border-[#e2e4ef] text-[#9ca3af] opacity-60 cursor-not-allowed"
+                  >
+                    <span className="material-symbols-outlined text-base">{f.icon}</span>
+                    <span className="text-xs font-bold">{f.codigo}</span>
+                    <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-[#f0f2f8]">Próximamente</span>
+                  </span>
+                )
+              }
+              const active = tabActivo === f.id
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setTabActivo(f.id)}
+                  className={`flex items-center gap-1.5 pl-2.5 pr-3.5 py-2 rounded-xl border-2 transition-all duration-150 whitespace-nowrap ${
+                    active
+                      ? 'border-solid border-[#003B43] bg-[#003B43]/10'
+                      : 'border-solid border-[#e2e4ef] bg-white hover:border-[#c3c6d7]'
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-base" style={{ color: active ? '#946000' : '#9ca3af' }}>{f.icon}</span>
+                  <span className={`text-xs font-bold ${active ? 'text-[#946000]' : 'text-[#434655]'}`}>{f.codigo}</span>
+                </button>
+              )
+            })}
+          </div>
+
+          {avisoFormato && (
+            <div className="flex items-center gap-2 mb-4 rounded-xl bg-amber-50 border border-amber-200 px-4 py-2.5">
+              <span className="material-symbols-outlined text-amber-600 text-base flex-shrink-0">info</span>
+              <p className="text-xs text-amber-800">{avisoFormato}</p>
+            </div>
+          )}
+
+          {/* Siempre en una sola fila de tablet para arriba (sm:flex-nowrap) — nunca baja tarjetas
+              a una segunda fila, sin importar si el formato activo trae 1, 2 o 4 campos de
+              monto. "Terceros" es angosta y fija (trae poco contenido, no necesita crecer); las
+              tarjetas de monto crecen con flex-1 para repartirse TODO el ancho sobrante entre
+              ellas (sin max-width — un tope ahí dejaba espacio muerto a la derecha cuando hay
+              pocas tarjetas, como en 1005 con solo 2) y, si el espacio queda justo (muchas
+              tarjetas a la vez), se encogen (flex-shrink) en vez de forzar un salto de línea —
+              el número nunca desborda porque StatsCard le achica la letra automáticamente según
+              el ancho disponible. En mobile (debajo de sm) sí se apilan una debajo de otra,
+              porque ahí literalmente no entra nada en una sola fila. */}
+          <div className="flex flex-wrap sm:flex-nowrap gap-4 mb-6">
+            <div className="w-full sm:w-36 flex-shrink-0">
+              <StatsCard
+                title={tabActivo === '1001' ? 'Filas (tercero × concepto)' : 'Terceros agrupados'}
+                value={borrador.totalTerceros}
+                icon="groups"
+                borderColor="#E5A70C"
+                iconColor="#E5A70C"
+              />
+            </div>
+            {camposFormato.map((c, i) => (
+              <div key={c.key} className="w-full sm:w-auto sm:flex-1">
+                <StatsCard
+                  title={c.statTitle}
+                  value={borrador[c.totalKey]}
+                  decimals={2}
+                  decimalSeparator=","
+                  thousandSeparator="."
+                  icon="payments"
+                  borderColor={STAT_COLORS[i % STAT_COLORS.length]}
+                  iconColor={STAT_COLORS[i % STAT_COLORS.length]}
+                  sub={c.statSub}
+                  subColor={STAT_COLORS[i % STAT_COLORS.length]}
+                />
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-white rounded-2xl border border-[#e2e4ef] shadow-sm overflow-hidden">
+            {/* table-fixed + anchos fijos en todo menos Razón social: así la tabla siempre cabe
+                en el ancho del contenedor sin scroll horizontal, y los nombres largos envuelven
+                en vez de forzar el ancho de la columna (antes con whitespace-nowrap + sticky). */}
+            <table className="w-full border-collapse text-sm table-fixed">
+              <thead>
+                <tr>
+                  <th className="bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-3 py-2.5 text-left">Razón social</th>
+                  <th className="w-14 bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-2 py-2.5 text-center">TDOC</th>
+                  <th className="w-32 bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-2 py-2.5 text-left">Identificación</th>
+                  <th className="w-10 bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-2 py-2.5 text-center">DV</th>
+                  {columnasExtra.map((c) => (
+                    <th key={c.label} className={`${c.width || 'w-24'} bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-2 py-2.5 text-center`}>{c.label}</th>
+                  ))}
+                  {camposFormato.map((c) => (
+                    <th key={c.key} className="w-36 bg-[#f8f9fc] text-[#434655] font-semibold border-b border-[#e2e4ef] px-2 py-2.5 text-right">{c.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {borrador.registros.map((r, idx) => (
+                  // El 1001 puede repetir el mismo tercero una vez por cada concepto distinto
+                  // (ver enriquecerConConceptos en el backend) — `idx` en la key evita choques.
+                  <tr key={`${r.tipoDocumento}-${r.identificacion}-${idx}`} className={idx % 2 === 1 ? 'bg-[#f8f9fc]' : ''}>
+                    <td className="px-3 py-2 border-b border-[#e2e4ef] text-[#191c1e] break-words">{r.razonSocial}</td>
+                    <td className="px-2 py-2 text-center border-b border-[#e2e4ef] text-[#434655]">{r.tipoDocumento}</td>
+                    <td className="px-2 py-2 border-b border-[#e2e4ef] text-[#434655] break-words">{r.identificacion}</td>
+                    <td className="px-2 py-2 text-center border-b border-[#e2e4ef] text-[#434655]">{r.digitoVerificacion}</td>
+                    {columnasExtra.map((c) => (
+                      <td key={c.label} className="px-2 py-2 text-center border-b border-[#e2e4ef] break-words">{c.render(r)}</td>
+                    ))}
+                    {camposFormato.map((c) => (
+                      <td key={c.key} className="px-2 py-2 text-right border-b border-[#e2e4ef] text-[#191c1e] font-medium break-words">{formatoMoneda(r[c.key])}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td className="px-3 py-2.5 bg-[#f8f9fc] border-t-2 border-[#e2e4ef] text-[#191c1e] font-bold">
+                    Total ({borrador.totalTerceros} {tabActivo === '1001' ? 'filas' : 'terceros'})
+                  </td>
+                  <td className="bg-[#f8f9fc] border-t-2 border-[#e2e4ef]" colSpan={3 + columnasExtra.length} />
+                  {camposFormato.map((c) => (
+                    <td key={c.key} className="px-2 py-2.5 text-right bg-[#f8f9fc] border-t-2 border-[#e2e4ef] text-[#191c1e] font-bold break-words">
+                      {formatoMoneda(borrador[c.totalKey])}
+                    </td>
+                  ))}
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          {errorMsg && (
+            <div className="mt-5 flex items-start gap-3 p-4 rounded-xl bg-red-50 border border-red-200">
+              <span className="material-symbols-outlined text-red-500 text-xl flex-shrink-0 mt-0.5">error</span>
+              <p className="text-sm font-semibold text-red-700">{errorMsg}</p>
+            </div>
+          )}
+
+          <div className="mt-6 flex flex-col items-center gap-2">
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={reiniciar}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold border border-[#d1d5db] text-[#434655] hover:bg-[#f3f4f6] transition active:scale-[0.97]"
+              >
+                <span className="material-symbols-outlined text-base">refresh</span>
+                Procesar otro archivo
+              </button>
+
+              {formatosAnalizados.length > 0 && (
+                <button
+                  onClick={descargaCombinada ? descargarDeNuevo : generar}
+                  disabled={generando}
+                  className="flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition active:scale-[0.97] disabled:opacity-60"
+                  style={{ background: '#003B43' }}
+                >
+                  {generando ? (
+                    <>
+                      <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-30" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                        <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                      </svg>
+                      Generando…
+                    </>
+                  ) : descargaCombinada ? (
+                    <>
+                      <span className="material-symbols-outlined text-base">download</span>
+                      Descargar de nuevo
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined text-base">file_download</span>
+                      {etiquetaGenerar}
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+
+            {formatosAnalizados.length > 0 && (
+              <p className="text-xs text-[#9ca3af] text-center">
+                Se va a generar: <span className="font-semibold text-[#434655]">{formatosAnalizados.join(', ')}</span>
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {estado === 'preview' && (
+        <button
+          onClick={() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' })}
+          title="Ir abajo"
+          aria-label="Ir abajo"
+          className="fixed bottom-6 right-6 z-20 flex items-center justify-center w-11 h-11 rounded-full text-[#20160A] shadow-lg hover:scale-105 active:scale-95 transition-transform"
+          style={{ background: '#E5A70C' }}
+        >
+          <span className="material-symbols-outlined text-xl">arrow_downward</span>
+        </button>
+      )}
+    </div>
+  )
+}

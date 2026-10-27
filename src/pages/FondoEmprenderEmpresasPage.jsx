@@ -1,0 +1,721 @@
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import StatsCard from '../components/StatsCard'
+import { getMacroStats, getMesVencidoHabilitado, resolveMesInicial, MACRO_PROCESSES } from '../data/fondoEmprender'
+import { api } from '../services/api'
+import { useSocket } from '../context/SocketContext'
+import { useToast } from '../context/ToastContext'
+import { normalizarBusqueda, contiene } from '../utils/busqueda'
+
+const SEM_COLOR = {
+  green:  '#16a34a',
+  yellow: '#d97706',
+  red:    '#ef4444',
+}
+
+const ESTADO_OPTIONS = [
+  { key: 'done',        label: 'Completado',  color: '#16a34a' },
+  { key: 'in_progress', label: 'En progreso', color: '#d97706' },
+  { key: 'pending',     label: 'Pendiente',   color: '#6b7280' },
+]
+
+const MONTHS = [
+  'Enero','Febrero','Marzo','Abril','Mayo','Junio',
+  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre',
+]
+
+const CATEGORIAS = [
+  { key: 'contable',   label: 'Contable' },
+  { key: 'tributario', label: 'Tributario' },
+]
+
+export default function FondoEmprenderEmpresasPage() {
+  const { addToast } = useToast()
+  const navigate = useNavigate()
+  const { socket } = useSocket()
+
+  const [searchParams, setSearchParams] = useSearchParams()
+  // month/year se inicializan desde la URL (si viene y está dentro del mes
+  // habilitado) para que un reload conserve la posición; si no, caen al mes
+  // habilitado (nunca a "hoy", que puede estar bloqueado por mes vencido).
+  const [mesInicial]      = useState(() => resolveMesInicial(searchParams))
+  const [month, setMonth] = useState(mesInicial.month)
+  const [year, setYear]   = useState(mesInicial.year)
+
+  // Seguimiento Mensual es de mes vencido: no se puede navegar más allá del
+  // mes calendario anterior (el mes en curso todavía no ha "vencido").
+  const mesHabilitado = getMesVencidoHabilitado()
+  const habilitadoYM = mesHabilitado.anio * 100 + mesHabilitado.mes
+  const atMesHabilitado = (year * 100 + (month + 1)) >= habilitadoYM
+
+  function goToMonth(newMonth, newYear) {
+    setMonth(newMonth)
+    setYear(newYear)
+    setSearchParams({ anio: String(newYear), mes: String(newMonth + 1) }, { replace: true })
+  }
+  function prevMonth() {
+    if (month === 0) goToMonth(11, year - 1)
+    else goToMonth(month - 1, year)
+  }
+  function nextMonth() {
+    // Bloquea siempre que el DESTINO exceda el mes habilitado, sin importar
+    // en qué mes se esté parado ahora.
+    const targetMonth = month === 11 ? 0 : month + 1
+    const targetYear  = month === 11 ? year + 1 : year
+    if ((targetYear * 100 + (targetMonth + 1)) > habilitadoYM) return
+    goToMonth(targetMonth, targetYear)
+  }
+
+  // ── server state ──────────────────────────────────────────────────────────
+  const [empresas, setEmpresas] = useState([])
+  const [loading, setLoading]   = useState(true)
+  const [error, setError]       = useState(null)
+
+  // ── filter state ─────────────────────────────────────────────────────────
+  const [search, setSearch]       = useState('')
+  const [activeTab, setActiveTab] = useState('todas')
+
+  // ── macroproceso + estado filter ─────────────────────────────────────────
+  // Aplica solo al presionar "Buscar" (no en vivo como el input de texto de
+  // arriba): el borrador (draft) vive en el panel, y solo pasa a `applied`
+  // —el que de verdad filtra `filtered`— al confirmar la búsqueda.
+  const [macroPanelOpen, setMacroPanelOpen]       = useState(false)
+  const [macroDraft, setMacroDraft]               = useState([])
+  const [estadoDraft, setEstadoDraft]             = useState('done')
+  const [appliedMacroFilter, setAppliedMacroFilter] = useState(null) // { macros: string[], estado: string } | null
+  const macroPanelRef = useRef(null)
+
+  // Cierra el panel al hacer clic afuera (mismo patrón que los dropdowns de
+  // FondoEmprenderPage.jsx). Si se cierra sin haber dado "Buscar", el
+  // borrador vuelve a reflejar el último filtro aplicado (o se vacía si
+  // nunca se aplicó ninguno) — así no queda "sucio" para la próxima vez que
+  // se abra.
+  useEffect(() => {
+    if (!macroPanelOpen) return
+    const handleClickOutside = (e) => {
+      if (macroPanelRef.current && !macroPanelRef.current.contains(e.target)) {
+        setMacroPanelOpen(false)
+        setMacroDraft(appliedMacroFilter?.macros ?? [])
+        setEstadoDraft(appliedMacroFilter?.estado ?? 'done')
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [macroPanelOpen, appliedMacroFilter])
+
+  function toggleMacroPanel() {
+    if (!macroPanelOpen) {
+      setMacroDraft(appliedMacroFilter?.macros ?? [])
+      setEstadoDraft(appliedMacroFilter?.estado ?? 'done')
+    }
+    setMacroPanelOpen(v => !v)
+  }
+  function toggleMacroDraft(id) {
+    setMacroDraft(prev => prev.includes(id) ? prev.filter(m => m !== id) : [...prev, id])
+  }
+  function aplicarMacroFilter() {
+    if (macroDraft.length === 0) { setAppliedMacroFilter(null); setMacroPanelOpen(false); return }
+    setAppliedMacroFilter({ macros: macroDraft, estado: estadoDraft })
+    setMacroPanelOpen(false)
+  }
+  function limpiarMacroFilter() {
+    setMacroDraft([])
+    setEstadoDraft('done')
+    setAppliedMacroFilter(null)
+  }
+
+  // ── inline edit state ─────────────────────────────────────────────────────
+  const [editingId, setEditingId] = useState(null)
+  const [editForm, setEditForm]   = useState({ name: '', categoria: 'contable', monthlyFee: '' })
+
+  function openEdit(empresa) {
+    setEditingId(empresa.id)
+    setEditForm({
+      name:       empresa.name,
+      categoria:  empresa.categoria ?? 'contable',
+      monthlyFee: empresa.monthlyFee != null ? String(empresa.monthlyFee) : '',
+    })
+  }
+  function closeEdit() { setEditingId(null) }
+
+  // ── fetch empresas ────────────────────────────────────────────────────────
+  const fetchEmpresas = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError(null)
+      const data = await api.getFondoEmpresas(undefined, year, month + 1)
+      setEmpresas(data)
+    } catch (err) {
+      if (err.status === 403) {
+        setError('No tienes permiso para ver Fondo Emprender')
+      } else {
+        setError(err.message || 'Error al cargar empresas')
+      }
+    } finally {
+      setLoading(false)
+    }
+  }, [month, year])
+
+  useEffect(() => { fetchEmpresas() }, [fetchEmpresas])
+
+  useEffect(() => {
+    window.addEventListener('focus', fetchEmpresas)
+    if (socket) socket.on('empresa:updated', fetchEmpresas)
+    return () => {
+      window.removeEventListener('focus', fetchEmpresas)
+      if (socket) socket.off('empresa:updated', fetchEmpresas)
+    }
+  }, [fetchEmpresas, socket])
+
+  // ── update ────────────────────────────────────────────────────────────────
+  async function handleEditar(empresaId) {
+    try {
+      const actualizada = await api.updateFondoEmpresa(empresaId, {
+        name:       editForm.name,
+        categoria:  editForm.categoria,
+        monthlyFee: editForm.monthlyFee !== '' ? parseFloat(editForm.monthlyFee) : null,
+      })
+      setEmpresas(prev => prev.map(e => e.id === empresaId ? actualizada : e))
+      closeEdit()
+    } catch (err) {
+      if (err.status === 403) {
+        addToast('No tienes permiso para editar', 'error')
+      } else {
+        addToast('Error: ' + err.message, 'error')
+      }
+    }
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  async function handleEliminar(empresaId) {
+    if (!confirm('¿Eliminar esta empresa? Esta acción borrará también su historial de pagos y checklist.')) return
+    try {
+      await api.deleteFondoEmpresa(empresaId)
+      setEmpresas(prev => prev.filter(e => e.id !== empresaId))
+      if (editingId === empresaId) setEditingId(null)
+    } catch (err) {
+      if (err.status === 403) {
+        addToast('No tienes permiso para eliminar', 'error')
+      } else {
+        addToast('Error: ' + err.message, 'error')
+      }
+    }
+  }
+
+  // ── derived stats — scoped to the active category tab ───────────────────
+  const summary = useMemo(() => {
+    const scope = activeTab === 'todas'
+      ? empresas
+      : empresas.filter(c => (c.categoria ?? 'contable') === activeTab)
+    const allStats    = scope.map(c => getMacroStats(c))
+    const completadas = allStats.filter(s => s.semaphore === 'green').length
+    const enProgreso  = allStats.filter(s => s.semaphore === 'yellow').length
+    const pendientes  = allStats.filter(s => s.semaphore === 'red').length
+    const pct = scope.length > 0 ? Math.round((completadas / scope.length) * 100) : 0
+    return { total: scope.length, completadas, enProgreso, pendientes, pct }
+  }, [empresas, activeTab])
+
+  const catCounts = useMemo(() => ({
+    contable:   empresas.filter(c => (c.categoria ?? 'contable') === 'contable').length,
+    tributario: empresas.filter(c => (c.categoria ?? 'contable') === 'tributario').length,
+  }), [empresas])
+
+  const tabs = [
+    { key: 'todas',      label: 'Todas',      count: empresas.length },
+    { key: 'contable',   label: 'Contable',   count: catCounts.contable },
+    { key: 'tributario', label: 'Tributario', count: catCounts.tributario },
+  ]
+
+  const filtered = useMemo(() => {
+    const q = normalizarBusqueda(search)
+    return empresas.filter(c => {
+      const matchSearch = !q || contiene(c.name, q)
+      const matchCat    = activeTab === 'todas' || (c.categoria ?? 'contable') === activeTab
+      const matchMacros = !appliedMacroFilter || appliedMacroFilter.macros.every(
+        mpId => (c.macroEstados?.[mpId] ?? 'pending') === appliedMacroFilter.estado
+      )
+      return matchSearch && matchCat && matchMacros
+    })
+  }, [empresas, search, activeTab, appliedMacroFilter])
+
+  // ── loading / error states ────────────────────────────────────────────────
+  if (loading) return (
+    <div className="flex items-center justify-center py-20 text-[#8890b5]">
+      <span className="material-symbols-outlined mr-2" style={{ fontSize: 20, animation: 'spin 1s linear infinite' }}>
+        progress_activity
+      </span>
+      Cargando empresas…
+    </div>
+  )
+
+  if (error) return (
+    <div className="flex flex-col items-center gap-3 py-20">
+      <span className="material-symbols-outlined text-[#ef4444]" style={{ fontSize: 32 }}>error</span>
+      <p className="text-sm text-[#ef4444]">{error}</p>
+      <button
+        onClick={fetchEmpresas}
+        className="px-4 py-2 text-sm rounded-lg border border-[#e2e4ef] hover:bg-[#f3f4f6] transition"
+      >
+        Reintentar
+      </button>
+    </div>
+  )
+
+  // ─────────────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col gap-5 min-w-0">
+
+      {/* ── Page header ──────────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="material-symbols-outlined text-2xl text-[#003B43]">corporate_fare</span>
+            <h1 className="text-xl font-bold text-[#191c1e]">Empresas</h1>
+          </div>
+          <p className="text-sm text-[#6b7280]">
+            Fondo Emprender · {empresas.length} empresas
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Month navigator */}
+          <div className="flex items-center gap-1 bg-white border border-[#e2e4ef] rounded-xl px-3 py-2 shadow-sm">
+            <button onClick={prevMonth} className="p-0.5 rounded hover:bg-[#f3f4f6] transition text-[#6b7280]">
+              <span className="material-symbols-outlined text-xl">chevron_left</span>
+            </button>
+            <span className="text-sm font-semibold text-[#191c1e] px-2 min-w-[130px] text-center">
+              {MONTHS[month]} {year}
+            </span>
+            <button
+              onClick={nextMonth}
+              disabled={atMesHabilitado}
+              title={atMesHabilitado ? 'El mes en curso aún no está habilitado (mes vencido)' : undefined}
+              className="p-0.5 rounded hover:bg-[#f3f4f6] transition text-[#6b7280] disabled:opacity-30 disabled:hover:bg-transparent disabled:cursor-not-allowed"
+            >
+              <span className="material-symbols-outlined text-xl">chevron_right</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Summary cards ────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        <StatsCard
+          title="Total empresas"
+          value={summary.total}
+          icon="corporate_fare"
+          borderColor="#003B43"
+          iconColor="#003B43"
+          sub={`${summary.pct}% completadas`}
+          subColor="#434655"
+        />
+        <StatsCard
+          title="Completadas"
+          value={summary.completadas}
+          icon="check_circle"
+          borderColor="#16a34a"
+          iconColor="#16a34a"
+          sub={summary.completadas > 0 ? `${summary.pct}% del total` : 'Sin completar'}
+          subColor={summary.completadas > 0 ? '#16a34a' : '#434655'}
+        />
+        <StatsCard
+          title="En progreso"
+          value={summary.enProgreso}
+          icon="timelapse"
+          borderColor="#d97706"
+          iconColor="#d97706"
+          sub="Avance parcial"
+          subColor="#434655"
+        />
+        <StatsCard
+          title="Pendientes"
+          value={summary.pendientes}
+          icon="pending_actions"
+          borderColor="#ef4444"
+          iconColor="#ef4444"
+          sub={summary.pendientes > 0 ? 'Sin iniciar' : 'Todo al día'}
+          subColor={summary.pendientes > 0 ? '#ef4444' : '#16a34a'}
+        />
+      </div>
+
+      {/* ── Filters row: pills + search ──────────────────────────────────── */}
+      <div className="flex items-center gap-3 flex-wrap">
+
+        {/* Segment control / pills */}
+        <div className="flex items-center bg-[#f0f2f8] rounded-xl p-1 gap-0.5 flex-shrink-0">
+          {tabs.map(({ key, label, count }) => {
+            const active = activeTab === key
+            return (
+              <button
+                key={key}
+                onClick={() => setActiveTab(key)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 whitespace-nowrap ${
+                  active
+                    ? 'bg-white text-[#003B43] shadow-sm'
+                    : 'text-[#6b7280] hover:text-[#191c1e]'
+                }`}
+              >
+                {label}
+                <span
+                  className="text-[10px] font-bold px-1.5 py-0.5 rounded-full transition-colors"
+                  style={
+                    active
+                      ? { background: '#003B43', color: '#fff' }
+                      : { background: '#e2e4ef', color: '#6b7280' }
+                  }
+                >
+                  {count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        {/* Search */}
+        <div className="relative flex-1 min-w-[180px] max-w-xs">
+          <span
+            className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-[#8890b5]"
+            style={{ fontSize: 17 }}
+          >
+            search
+          </span>
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Buscar empresa..."
+            className="w-full pl-9 pr-4 py-2 text-sm rounded-xl border border-[#e2e4ef] bg-white text-[#191c1e] outline-none focus:ring-2 focus:ring-[#003B43]/30"
+          />
+        </div>
+
+      </div>
+
+      {/* ── Verificar macroprocesos — botón angosto alineado a la derecha,
+           justo arriba de la tabla. Al desplegar: columna de macroprocesos
+           a la izquierda, columna de estado a la derecha. Mismo lenguaje
+           visual que el resto de la página (punto de color como el estado
+           de la ficha de detalle). ────────────────────────────────────── */}
+      <div className="flex flex-col gap-2">
+        <div className="flex justify-end">
+          <div className="relative" ref={macroPanelRef}>
+            <button
+              onClick={toggleMacroPanel}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border transition ${
+                appliedMacroFilter
+                  ? 'border-[#003B43] text-[#003B43] bg-[#003B43]/10'
+                  : 'border-[#e2e4ef] text-[#6b7280] hover:bg-[#f3f4f6]'
+              }`}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>fact_check</span>
+              {appliedMacroFilter
+                ? `${appliedMacroFilter.macros.length} macroproceso${appliedMacroFilter.macros.length > 1 ? 's' : ''} · ${ESTADO_OPTIONS.find(o => o.key === appliedMacroFilter.estado)?.label}`
+                : 'Verificar macroprocesos'}
+              {appliedMacroFilter && (
+                <span
+                  role="button"
+                  onClick={e => { e.stopPropagation(); limpiarMacroFilter() }}
+                  className="material-symbols-outlined hover:text-[#ef4444]"
+                  style={{ fontSize: 15 }}
+                  title="Limpiar filtro"
+                >
+                  close
+                </span>
+              )}
+              <span
+                className="material-symbols-outlined transition-transform duration-150"
+                style={{ fontSize: 16, transform: macroPanelOpen ? 'rotate(180deg)' : 'none' }}
+              >
+                expand_more
+              </span>
+            </button>
+
+            {macroPanelOpen && (
+              <div className="absolute z-20 top-full mt-2 right-0 w-[340px] bg-white border border-[#e2e4ef] rounded-xl shadow-lg p-4 flex flex-col gap-3">
+                <div className="grid grid-cols-2 gap-4">
+                  {/* Macroprocesos — columna izquierda */}
+                  <div className="flex flex-col gap-1.5 min-w-0">
+                    <label className="text-[10px] font-semibold text-[#434655] uppercase tracking-wide">
+                      Macroprocesos
+                    </label>
+                    <div className="flex flex-col gap-0.5">
+                      {MACRO_PROCESSES.map(({ id, name }) => {
+                        const active = macroDraft.includes(id)
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => toggleMacroDraft(id)}
+                            className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[11px] font-semibold text-left transition-all duration-150 ${
+                              active ? 'text-white' : 'text-[#6b7280]'
+                            }`}
+                            style={{ background: active ? '#003B43' : 'transparent' }}
+                          >
+                            <span className="material-symbols-outlined flex-shrink-0" style={{ fontSize: 15 }}>
+                              {active ? 'check_box' : 'check_box_outline_blank'}
+                            </span>
+                            <span className="truncate">{name}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Estado — columna derecha */}
+                  <div className="flex flex-col gap-1.5 min-w-0">
+                    <label className="text-[10px] font-semibold text-[#434655] uppercase tracking-wide">
+                      Estado
+                    </label>
+                    <div className="flex flex-col gap-0.5">
+                      {ESTADO_OPTIONS.map(({ key, label, color }) => {
+                        const active = estadoDraft === key
+                        return (
+                          <button
+                            key={key}
+                            type="button"
+                            onClick={() => setEstadoDraft(key)}
+                            className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[11px] font-semibold text-left transition-all duration-150 ${
+                              active ? 'bg-[#f0f2f8]' : ''
+                            }`}
+                          >
+                            <span
+                              className="w-2 h-2 rounded-full flex-shrink-0"
+                              style={{ background: active ? color : '#c3c6d7' }}
+                            />
+                            <span
+                              className={active ? '' : 'text-[#6b7280]'}
+                              style={active ? { color } : undefined}
+                            >
+                              {label}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#f0f2f8]">
+                  <button
+                    onClick={limpiarMacroFilter}
+                    className="px-2 py-1.5 rounded-lg text-xs font-semibold text-[#6b7280] hover:bg-[#f3f4f6] transition"
+                  >
+                    Limpiar
+                  </button>
+                  <button
+                    onClick={aplicarMacroFilter}
+                    disabled={macroDraft.length === 0}
+                    className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-40 transition active:scale-[0.97]"
+                    style={{ background: '#003B43' }}
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 15 }}>search</span>
+                    Buscar
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {appliedMacroFilter && (
+          <div className="flex items-center gap-1.5 text-xs text-[#434655] justify-end">
+            <span className="material-symbols-outlined flex-shrink-0" style={{ fontSize: 14, color: '#003B43' }}>info</span>
+            Mostrando <span className="font-bold text-[#191c1e]">{filtered.length}</span> empresa{filtered.length !== 1 ? 's' : ''} con{' '}
+            <span className="font-semibold">{appliedMacroFilter.macros.map(id => MACRO_PROCESSES.find(m => m.id === id)?.name).join(', ')}</span> en estado{' '}
+            <span className="font-semibold" style={{ color: ESTADO_OPTIONS.find(o => o.key === appliedMacroFilter.estado)?.color }}>
+              {ESTADO_OPTIONS.find(o => o.key === appliedMacroFilter.estado)?.label}
+            </span>
+          </div>
+        )}
+
+      {/* ── Compact table ────────────────────────────────────────────────── */}
+      {filtered.length > 0 ? (
+        <div className="bg-white rounded-xl border border-[#e2e4ef] shadow-sm overflow-hidden">
+          {filtered.map((company, idx) => {
+            const stats = getMacroStats(company)
+            const color = SEM_COLOR[stats.semaphore]
+            const pct   = Math.round((stats.done / stats.total) * 100)
+            const isEditing = editingId === company.id
+
+            return (
+              <div key={company.id}>
+                {/* ── Company row ─────────────────────────────────────── */}
+                <div
+                  className={`flex items-center gap-2 sm:gap-4 px-3 sm:px-4 py-3 hover:bg-[#f3f4f6] transition-colors group cursor-pointer${
+                    idx > 0 ? ' border-t border-[#f0f2f8]' : ''
+                  }`}
+                  onClick={() => navigate(`/fondo-emprender/empresas/${company.id}?anio=${year}&mes=${month + 1}`)}
+                >
+                  {/* Status dot */}
+                  <span
+                    className="w-2 h-2 rounded-full flex-shrink-0"
+                    style={{ background: color }}
+                  />
+
+                  {/* Company name */}
+                  <span className="flex-1 min-w-0 text-sm font-semibold text-[#191c1e] truncate">
+                    {company.name}
+                  </span>
+
+                  {/* Category badge */}
+                  <span
+                    className="hidden sm:inline-flex text-[10px] font-semibold px-2 py-0.5 rounded-full flex-shrink-0 uppercase tracking-wide"
+                    style={
+                      (company.categoria ?? 'contable') === 'contable'
+                        ? { background: '#eef3ff', color: '#004ac6' }
+                        : { background: '#f0fdf4', color: '#16a34a' }
+                    }
+                  >
+                    {company.categoria ?? 'contable'}
+                  </span>
+
+                  {/* Progress bar + count */}
+                  <div className="flex items-center gap-1.5 sm:gap-2.5 flex-shrink-0">
+                    <div className="hidden sm:block w-24 h-1.5 rounded-full bg-[#e8eaf0] overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{ width: `${pct}%`, background: color }}
+                      />
+                    </div>
+                    <span
+                      className="text-xs font-bold w-7 text-right tabular-nums"
+                      style={{ color }}
+                    >
+                      {stats.done}/7
+                    </span>
+                  </div>
+
+                  {/* Action buttons — stop propagation so they don't navigate */}
+                  <div
+                    className="flex items-center gap-0.5 flex-shrink-0"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <button
+                      onClick={() => isEditing ? closeEdit() : openEdit(company)}
+                      title={isEditing ? 'Cerrar edición' : 'Editar empresa'}
+                      className={`p-1.5 rounded-lg transition ${
+                        isEditing
+                          ? 'text-[#003B43] bg-[#003B43]/10'
+                          : 'text-[#c3c6d7] hover:text-[#003B43]'
+                      }`}
+                    >
+                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+                        {isEditing ? 'close' : 'edit'}
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => handleEliminar(company.id)}
+                      title="Eliminar empresa"
+                      className="p-1.5 rounded-lg text-[#c3c6d7] hover:text-[#ef4444] transition"
+                    >
+                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>delete</span>
+                    </button>
+                  </div>
+
+                  {/* Arrow */}
+                  <span
+                    className="material-symbols-outlined text-[#c3c6d7] group-hover:text-[#003B43] transition flex-shrink-0"
+                    style={{ fontSize: 18 }}
+                  >
+                    chevron_right
+                  </span>
+                </div>
+
+                {/* ── Inline edit panel ────────────────────────────────── */}
+                {isEditing && (
+                  <div
+                    className="px-5 py-4 bg-[#003B43]/10 border-t border-[#e2e4ef] flex flex-col gap-3"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <div className="flex flex-wrap gap-3">
+                      {/* Name */}
+                      <div className="flex flex-col gap-1 flex-1 min-w-[160px]">
+                        <label className="text-[10px] font-semibold text-[#434655] uppercase tracking-wide">
+                          Nombre
+                        </label>
+                        <input
+                          autoFocus
+                          value={editForm.name}
+                          onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
+                          className="px-3 py-1.5 text-sm rounded-lg border border-[#e2e4ef] bg-white text-[#191c1e] outline-none focus:ring-2 focus:ring-[#003B43]/30"
+                        />
+                      </div>
+
+                      {/* Categoría */}
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-semibold text-[#434655] uppercase tracking-wide">
+                          Categoría
+                        </label>
+                        <div className="flex gap-1.5">
+                          {CATEGORIAS.map(({ key, label }) => {
+                            const active = editForm.categoria === key
+                            return (
+                              <button
+                                key={key}
+                                type="button"
+                                onClick={() => setEditForm(f => ({ ...f, categoria: key }))}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border-2 transition-all"
+                                style={{
+                                  borderColor: active ? '#003B43' : '#e2e4ef',
+                                  background:  active ? '#003B431a' : 'transparent',
+                                  color:       active ? '#003B43' : '#6b7280',
+                                }}
+                              >
+                                <span
+                                  className="w-1.5 h-1.5 rounded-full"
+                                  style={{ background: active ? '#003B43' : '#d1d5db' }}
+                                />
+                                {label}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Monthly fee */}
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-semibold text-[#434655] uppercase tracking-wide">
+                          Mensualidad
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={editForm.monthlyFee}
+                          onChange={e => setEditForm(f => ({ ...f, monthlyFee: e.target.value }))}
+                          placeholder="—"
+                          className="px-3 py-1.5 text-sm rounded-lg border border-[#e2e4ef] bg-white text-[#191c1e] outline-none focus:ring-2 focus:ring-[#003B43]/30 w-36"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 justify-end">
+                      <button
+                        onClick={closeEdit}
+                        className="px-4 py-1.5 rounded-lg text-xs font-semibold text-[#6b7280] hover:bg-[#f3f4f6] transition"
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        onClick={() => handleEditar(company.id)}
+                        disabled={!editForm.name.trim()}
+                        className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 transition active:scale-[0.97]"
+                        style={{ background: '#003B43' }}
+                      >
+                        Guardar
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="text-center py-16 text-[#8890b5] text-sm">
+          {search || activeTab !== 'todas' || appliedMacroFilter
+            ? 'No hay empresas que coincidan con el filtro'
+            : 'No se encontraron empresas'}
+        </div>
+      )}
+      </div>
+    </div>
+  )
+}

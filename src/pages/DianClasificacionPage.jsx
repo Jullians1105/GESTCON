@@ -1,0 +1,1616 @@
+import { useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect } from 'react'
+import { createPortal } from 'react-dom'
+import { useNavigate, useParams } from 'react-router-dom'
+import { api } from '../services/api'
+import Cargando from '../components/Cargando'
+
+// ── opciones de clasificación (incluyendo N/A) ─────────────────────────────────
+const OPCIONES = [
+  { label: 'N/A (No aplica)',      clasificacion: 'N/A',           tasa: null  },
+  { label: 'Autorretenedor',      clasificacion: 'Autorretenedor', tasa: null  },
+  { label: 'Compras 0,10%',       clasificacion: 'Compras',        tasa: 0.10 },
+  { label: 'Compras 1,50%',       clasificacion: 'Compras',        tasa: 1.50 },
+  { label: 'Compras 2,50%',       clasificacion: 'Compras',        tasa: 2.50 },
+  { label: 'Compras 3,50%',       clasificacion: 'Compras',        tasa: 3.50 },
+  { label: 'Servicios 1%',        clasificacion: 'Servicios',      tasa: 1.00 },
+  { label: 'Servicios 2%',        clasificacion: 'Servicios',      tasa: 2.00 },
+  { label: 'Servicios 3,50%',     clasificacion: 'Servicios',      tasa: 3.50 },
+  { label: 'Servicios 4%',        clasificacion: 'Servicios',      tasa: 4.00 },
+  { label: 'Arrendamiento 3,50%', clasificacion: 'Arrendamiento',  tasa: 3.50 },
+  { label: 'Arrendamiento 4%',    clasificacion: 'Arrendamiento',  tasa: 4.00 },
+  { label: 'Honorarios 11%',      clasificacion: 'Honorarios',     tasa: 11.00 },
+]
+
+// Solo para compras (mismas filas que piden retención) — las ventas no se clasifican, solo
+// se guarda su IVA generado (ver backend). Mismo texto exacto que CLASES_IVA/CONCEPTOS en
+// dianController.js — si se desincronizan, el PATCH del backend rechaza el valor con 400.
+const CLASES_IVA = ['Mayor valor', 'Descontable', 'Activo fijo', 'No aplica']
+const CONCEPTOS = [
+  'Servicios', 'Compras', 'Activo fijo', 'Honorarios', 'Arriendos',
+  'Adecuaciones', 'Compras diversos', 'Diversos', 'No deducible', 'No aplica',
+]
+
+// ── helpers ────────────────────────────────────────────────────────────────────
+const formatFecha = (iso) => {
+  if (!iso) return '—'
+  const [y, m, d] = iso.split('-')
+  return `${d}/${m}/${y}`
+}
+
+const formatCOP = (n) =>
+  new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(n ?? 0)
+
+// Mismo arreglo que MESES_ES en DianExportacionPage.jsx — se repite acá para no acoplar dos
+// páginas por un array de 12 strings.
+const MESES_ES = [
+  'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre',
+]
+
+const truncate = (s, n) =>
+  s && s.length > n ? s.slice(0, n) + '…' : (s || '—')
+
+// Base = Total neto de TODOS los impuestos que trae la fila (no solo IVA) — es sobre lo
+// que realmente se calcula la retención (ver backend, getBaseRetencion), así que la
+// columna muestra/filtra/ordena por este valor en vez del Total con impuestos incluidos.
+const CAMPOS_IMPUESTOS_BASE = [
+  'iva', 'ica', 'ic', 'inc', 'timbre', 'incBolsas', 'inCarbono',
+  'inCombustibles', 'icDatos', 'icl', 'inpp', 'ibua', 'icui',
+]
+const getBase = (f) =>
+  (f.total ?? 0) - CAMPOS_IMPUESTOS_BASE.reduce((acc, campo) => acc + (f[campo] ?? 0), 0)
+
+// ── indicador de autoguardado ──────────────────────────────────────────────────
+// Antes era texto ("guardando…" / "✓") que aparecía y desaparecía al lado del <select> — como
+// la celda no tiene ancho fijo, cada vez que el texto aparecía la columna entera se ensanchaba
+// (y con ella la fila, "se agranda todo feo"), y al desaparecer volvía a angostarse: un salto
+// visual en cada clasificación. Ahora es un ícono dentro de una caja de ancho fijo (`w-5`) que
+// siempre ocupa el mismo espacio exista o no exista estado — solo cambia el ícono de adentro
+// (spinner mientras guarda, check al terminar), la fila ya no se mueve.
+function SaveIndicator({ estado }) {
+  return (
+    <span className="w-5 h-5 flex items-center justify-center flex-shrink-0 ml-1">
+      {estado === 'saving' && (
+        <span className="material-symbols-outlined text-[16px] text-amber-500 animate-spin">progress_activity</span>
+      )}
+      {estado === 'saved' && (
+        <span className="material-symbols-outlined text-[16px] text-green-600">check_circle</span>
+      )}
+    </span>
+  )
+}
+
+// Espacio mínimo que se deja siempre libre respecto al borde de la ventana.
+const MARGEN_VIEWPORT = 12
+
+// Ambos menús de filtro (columna y total) se posicionan `fixed` según el rect del botón que
+// los abre, solo con `top: rect.bottom + 4` — sin revisar si había espacio hacia abajo. Con
+// muchas filas (ej. muchos emisores distintos en la clasificación de retención), el menú se
+// salía por debajo del viewport y el pie con "Cancelar"/"Aceptar" quedaba inalcanzable — el bug
+// reportado: no se podía guardar el filtro. `usePosicionVertical` mide la altura ya renderizada
+// (con el `max-h-48` normal de la lista, o sea el peor caso "de diseño") una sola vez al abrir y
+// decide: si cabe abajo se queda igual que antes; si no cabe abajo pero sí arriba, abre hacia
+// arriba; si no cabe en ningún lado (viewport muy bajo), se queda del lado con más espacio y le
+// pone un tope a su propia altura — solo la lista de valores hace scroll interno, el pie con los
+// botones nunca queda fuera de pantalla.
+function usePosicionVertical(rect, contenedorRef) {
+  const [pos, setPos] = useState({ top: rect.bottom + 4, maxHeight: null })
+  const alturaNaturalRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const el = contenedorRef.current
+    if (!el) return
+    if (alturaNaturalRef.current == null) alturaNaturalRef.current = el.offsetHeight
+    const alto = alturaNaturalRef.current
+    const espacioAbajo = window.innerHeight - rect.bottom - MARGEN_VIEWPORT
+    const espacioArriba = rect.top - MARGEN_VIEWPORT
+
+    if (alto <= espacioAbajo) {
+      setPos({ top: rect.bottom + 4, maxHeight: null })
+    } else if (alto <= espacioArriba) {
+      setPos({ bottom: window.innerHeight - rect.top + 4, maxHeight: null })
+    } else if (espacioAbajo >= espacioArriba) {
+      setPos({ top: rect.bottom + 4, maxHeight: Math.max(espacioAbajo, 120) })
+    } else {
+      setPos({ bottom: MARGEN_VIEWPORT, maxHeight: Math.max(espacioArriba, 120) })
+    }
+  }, [rect, contenedorRef])
+
+  return pos
+}
+
+// ── menú de filtro por columna (checklist estilo Excel) ─────────────────────────
+// Se renderiza en un portal a document.body y se posiciona con `fixed` según el
+// rect del botón que lo abrió, para no quedar recortado por el overflow-hidden
+// de la tarjeta de la tabla.
+function ColumnFilterMenu({ rect, valores, seleccion, onAplicar, onCerrar, align = 'left' }) {
+  const [busqueda, setBusqueda] = useState('')
+  const [borrador, setBorrador] = useState(() => new Set(seleccion ?? valores.map((v) => v.value)))
+  const ref = useRef(null)
+  const posVertical = usePosicionVertical(rect, ref)
+
+  useEffect(() => {
+    const onClickFuera = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) onCerrar()
+    }
+    document.addEventListener('mousedown', onClickFuera)
+    return () => document.removeEventListener('mousedown', onClickFuera)
+  }, [onCerrar])
+
+  const visibles = useMemo(() => {
+    const q = busqueda.trim().toLowerCase()
+    return q ? valores.filter((v) => v.label.toLowerCase().includes(q)) : valores
+  }, [valores, busqueda])
+
+  const todasVisiblesMarcadas = visibles.length > 0 && visibles.every((v) => borrador.has(v.value))
+
+  const toggleTodasVisibles = () => {
+    setBorrador((prev) => {
+      const next = new Set(prev)
+      const marcarTodas = !visibles.every((v) => next.has(v.value))
+      for (const v of visibles) {
+        if (marcarTodas) next.add(v.value)
+        else next.delete(v.value)
+      }
+      return next
+    })
+  }
+
+  const toggleValor = (value) => {
+    setBorrador((prev) => {
+      const next = new Set(prev)
+      if (next.has(value)) next.delete(value)
+      else next.add(value)
+      return next
+    })
+  }
+
+  const style = {
+    position: 'fixed',
+    ...(posVertical.top != null ? { top: posVertical.top } : { bottom: posVertical.bottom }),
+    ...(posVertical.maxHeight != null ? { maxHeight: posVertical.maxHeight } : {}),
+    ...(align === 'right' ? { right: window.innerWidth - rect.right } : { left: rect.left }),
+  }
+
+  // Al aceptar, solo cuentan los valores que siguen visibles bajo la búsqueda actual —
+  // si el usuario buscó "Acme" y no tocó ningún checkbox, "borrador" todavía trae TODOS
+  // los valores marcados por default (incluidos los que la búsqueda ocultó), y aplicar
+  // el filtro tal cual equivalía a "mostrar todo" (el bug reportado: buscar + Aceptar no
+  // hacía nada). Intersectar con "visibles" hace que buscar + Aceptar filtre a lo buscado.
+  const aplicar = () => {
+    const visibleValues = new Set(visibles.map((v) => v.value))
+    const seleccionFinal = new Set([...borrador].filter((v) => visibleValues.has(v)))
+    onAplicar(seleccionFinal.size === valores.length ? null : seleccionFinal)
+  }
+
+  return createPortal(
+    <div
+      ref={ref}
+      style={style}
+      className="w-64 normal-case font-normal tracking-normal bg-white border border-[#d1d5db] rounded-xl shadow-lg p-3 z-50 flex flex-col overflow-hidden"
+    >
+      <div className="relative mb-2 flex-shrink-0">
+        <span className="material-symbols-outlined text-base text-[#8890b5] absolute left-2 top-1/2 -translate-y-1/2">search</span>
+        <input
+          type="text"
+          autoFocus
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          placeholder="Buscar…"
+          className="w-full text-sm border border-[#d1d5db] rounded-lg pl-8 pr-2 py-1.5 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent"
+        />
+      </div>
+
+      <label className="flex items-center gap-2 px-1 py-1.5 border-b border-[#f0f2f8] mb-1 cursor-pointer flex-shrink-0">
+        <input
+          type="checkbox"
+          checked={todasVisiblesMarcadas}
+          onChange={toggleTodasVisibles}
+          className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer"
+        />
+        <span className="text-sm font-medium text-[#191c1e]">(Seleccionar todo)</span>
+      </label>
+
+      <div className="max-h-48 flex-1 min-h-0 overflow-y-auto flex flex-col gap-0.5">
+        {visibles.length === 0 ? (
+          <p className="text-xs text-[#8890b5] px-1 py-2">Sin resultados</p>
+        ) : visibles.map((v) => (
+          <label
+            key={v.value}
+            className="flex items-center gap-2 px-1 py-1 rounded hover:bg-[#E3EEEE] cursor-pointer"
+          >
+            <input
+              type="checkbox"
+              checked={borrador.has(v.value)}
+              onChange={() => toggleValor(v.value)}
+              className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer flex-shrink-0"
+            />
+            <span className="text-sm text-[#191c1e] truncate" title={v.label}>{v.label}</span>
+          </label>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-end gap-2 mt-3 pt-2 border-t border-[#f0f2f8] flex-shrink-0">
+        <button
+          onClick={onCerrar}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold text-[#6b7280] hover:bg-[#f0f2f8]"
+        >
+          Cancelar
+        </button>
+        <button
+          onClick={aplicar}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold text-[#ffffff]"
+          style={{ background: '#003B43' }}
+        >
+          Aceptar
+        </button>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+// ── menú de filtro de Total: checklist de valores, angostable por texto y/o rango ──
+// Desde/Hasta funcionan igual que el buscador: solo acotan qué filas de la lista se ven
+// y se pueden tildar/destildar en masa — no son un modo aparte, se combinan con la
+// búsqueda de texto para que el usuario vea los precios reales mientras escribe el rango.
+function TotalFilterMenu({ rect, valores, seleccion, onAplicar, onCerrar, align = 'left' }) {
+  const [busqueda, setBusqueda] = useState('')
+  const [desde, setDesde] = useState('')
+  const [hasta, setHasta] = useState('')
+  const [borrador, setBorrador] = useState(() => new Set(seleccion ?? valores.map((v) => v.value)))
+  const ref = useRef(null)
+  const posVertical = usePosicionVertical(rect, ref)
+
+  useEffect(() => {
+    const onClickFuera = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) onCerrar()
+    }
+    document.addEventListener('mousedown', onClickFuera)
+    return () => document.removeEventListener('mousedown', onClickFuera)
+  }, [onCerrar])
+
+  const visibles = useMemo(() => {
+    const q = busqueda.trim().toLowerCase()
+    const desdeNum = desde.trim() === '' ? null : Number(desde)
+    const hastaNum = hasta.trim() === '' ? null : Number(hasta)
+    return valores.filter((v) => {
+      if (q && !v.label.toLowerCase().includes(q)) return false
+      if (desdeNum != null && v.value < desdeNum) return false
+      if (hastaNum != null && v.value > hastaNum) return false
+      return true
+    })
+  }, [valores, busqueda, desde, hasta])
+
+  const todasVisiblesMarcadas = visibles.length > 0 && visibles.every((v) => borrador.has(v.value))
+
+  const toggleTodasVisibles = () => {
+    setBorrador((prev) => {
+      const next = new Set(prev)
+      const marcarTodas = !visibles.every((v) => next.has(v.value))
+      for (const v of visibles) {
+        if (marcarTodas) next.add(v.value)
+        else next.delete(v.value)
+      }
+      return next
+    })
+  }
+
+  const toggleValor = (value) => {
+    setBorrador((prev) => {
+      const next = new Set(prev)
+      if (next.has(value)) next.delete(value)
+      else next.add(value)
+      return next
+    })
+  }
+
+  const style = {
+    position: 'fixed',
+    ...(posVertical.top != null ? { top: posVertical.top } : { bottom: posVertical.bottom }),
+    ...(posVertical.maxHeight != null ? { maxHeight: posVertical.maxHeight } : {}),
+    ...(align === 'right' ? { right: window.innerWidth - rect.right } : { left: rect.left }),
+  }
+
+  const inputClase =
+    'w-full text-sm border border-[#d1d5db] rounded-lg px-2 py-1.5 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent'
+
+  // Mismo fix que ColumnFilterMenu: intersectar con "visibles" para que buscar/acotar por
+  // rango + Aceptar sin tocar checkboxes filtre a lo que quedó visible, no a "todo".
+  const aplicar = () => {
+    const visibleValues = new Set(visibles.map((v) => v.value))
+    const seleccionFinal = new Set([...borrador].filter((v) => visibleValues.has(v)))
+    onAplicar(seleccionFinal.size === valores.length ? null : seleccionFinal)
+  }
+
+  return createPortal(
+    <div
+      ref={ref}
+      style={style}
+      className="w-64 normal-case font-normal tracking-normal bg-white border border-[#d1d5db] rounded-xl shadow-lg p-3 z-50 flex flex-col overflow-hidden"
+    >
+      <div className="relative mb-2 flex-shrink-0">
+        <span className="material-symbols-outlined text-base text-[#8890b5] absolute left-2 top-1/2 -translate-y-1/2">search</span>
+        <input
+          type="text"
+          autoFocus
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          placeholder="Buscar…"
+          className={`${inputClase} pl-8`}
+        />
+      </div>
+
+      <div className="flex items-center gap-2 mb-2 flex-shrink-0">
+        <input
+          type="number"
+          value={desde}
+          onChange={(e) => setDesde(e.target.value)}
+          placeholder="Desde $"
+          className={inputClase}
+        />
+        <span className="text-xs text-[#8890b5]">—</span>
+        <input
+          type="number"
+          value={hasta}
+          onChange={(e) => setHasta(e.target.value)}
+          placeholder="Hasta $"
+          className={inputClase}
+        />
+      </div>
+
+      <label className="flex items-center gap-2 px-1 py-1.5 border-b border-[#f0f2f8] mb-1 cursor-pointer flex-shrink-0">
+        <input
+          type="checkbox"
+          checked={todasVisiblesMarcadas}
+          onChange={toggleTodasVisibles}
+          className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer"
+        />
+        <span className="text-sm font-medium text-[#191c1e]">(Seleccionar todo)</span>
+      </label>
+
+      <div className="max-h-48 flex-1 min-h-0 overflow-y-auto flex flex-col gap-0.5">
+        {visibles.length === 0 ? (
+          <p className="text-xs text-[#8890b5] px-1 py-2">Sin resultados</p>
+        ) : visibles.map((v) => (
+          <label
+            key={v.value}
+            className="flex items-center gap-2 px-1 py-1 rounded hover:bg-[#E3EEEE] cursor-pointer"
+          >
+            <input
+              type="checkbox"
+              checked={borrador.has(v.value)}
+              onChange={() => toggleValor(v.value)}
+              className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer flex-shrink-0"
+            />
+            <span className="text-sm text-[#191c1e] truncate" title={v.label}>{v.label}</span>
+          </label>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-end gap-2 mt-3 pt-2 border-t border-[#f0f2f8] flex-shrink-0">
+        <button
+          onClick={onCerrar}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold text-[#6b7280] hover:bg-[#f0f2f8]"
+        >
+          Cancelar
+        </button>
+        <button
+          onClick={aplicar}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold text-[#ffffff]"
+          style={{ background: '#003B43' }}
+        >
+          Aceptar
+        </button>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+// ── autoguardado genérico para un campo plano de la fila (clasificacionIva / concepto) ──
+// A diferencia de la retención (que empareja clasificación + tasa en una sola opción), estos
+// dos campos son un valor de texto simple — mismo debounce de 1500ms y mismo indicador que
+// FilaClasificacion, factorizado acá para no duplicar la lógica de guardado dos veces.
+// El PATCH solo envía este campo (nunca los otros tres): el backend conserva lo demás tal
+// cual estaba (ver "provisto" en dianController.js#patchBorrador).
+function useClasificacionSimple({ borradorId, indice, campo, valorActual, onGuardado }) {
+  const [guardadoEstado, setGuardadoEstado] = useState(valorActual ? 'saved' : null)
+  const [error, setError] = useState(null)
+  const timerRef = useRef(null)
+
+  const handleChange = useCallback((e) => {
+    const valor = e.target.value || null
+    onGuardado(indice, valor)
+    setError(null)
+
+    if (!valor) {
+      setGuardadoEstado(null)
+      if (timerRef.current) clearTimeout(timerRef.current)
+      return
+    }
+
+    setGuardadoEstado('saving')
+    if (timerRef.current) clearTimeout(timerRef.current)
+
+    timerRef.current = setTimeout(async () => {
+      try {
+        await api.patchDianBorrador(borradorId, { indice, [campo]: valor })
+        setGuardadoEstado('saved')
+        setTimeout(() => setGuardadoEstado(null), 2000)
+      } catch (err) {
+        setGuardadoEstado(null)
+        setError(err.message || 'Error al guardar. Intenta de nuevo.')
+      }
+    }, 1500)
+  }, [indice, borradorId, campo, onGuardado])
+
+  const handleRetry = useCallback(() => {
+    if (!valorActual) return
+    setError(null)
+    handleChange({ target: { value: valorActual } })
+  }, [valorActual, handleChange])
+
+  return { guardadoEstado, error, handleChange, handleRetry }
+}
+
+// ── fila de la tabla ───────────────────────────────────────────────────────────
+function FilaClasificacion({
+  fila, borradorId, valorActual, onClasificado, isEven, seleccionada, onToggleSeleccion,
+  empresaId, valorIvaActual, onClasificadoIva, valorConceptoActual, onClasificadoConcepto,
+}) {
+  const [guardadoEstado, setGuardadoEstado] = useState(
+    fila.clasificacionRetencion ? 'saved' : null
+  )
+  const [error, setError] = useState(null)
+  const timerRef = useRef(null)
+
+  const handleChange = useCallback((e) => {
+    const opcionLabel = e.target.value
+    const opcion = OPCIONES.find((o) => o.label === opcionLabel) ?? null
+
+    onClasificado(fila.indice, opcion)
+    setError(null)
+
+    if (!opcion) {
+      setGuardadoEstado(null)
+      if (timerRef.current) clearTimeout(timerRef.current)
+      return
+    }
+
+    setGuardadoEstado('saving')
+    if (timerRef.current) clearTimeout(timerRef.current)
+
+    timerRef.current = setTimeout(async () => {
+      try {
+        await api.patchDianBorrador(borradorId, {
+          indice:                 fila.indice,
+          clasificacionRetencion: opcion.clasificacion,
+          tasaRetencion:          opcion.tasa,
+        })
+        setGuardadoEstado('saved')
+        setTimeout(() => setGuardadoEstado(null), 2000)
+      } catch (err) {
+        setGuardadoEstado(null)
+        setError(err.message || 'Error al guardar. Intenta de nuevo.')
+      }
+    }, 1500)
+  }, [fila.indice, borradorId, onClasificado])
+
+  const handleRetry = () => {
+    if (!valorActual) return
+    setError(null)
+    handleChange({ target: { value: valorActual.label } })
+  }
+
+  const iva = useClasificacionSimple({
+    borradorId, indice: fila.indice, campo: 'clasificacionIva',
+    valorActual: valorIvaActual, onGuardado: onClasificadoIva,
+  })
+  const concepto = useClasificacionSimple({
+    borradorId, indice: fila.indice, campo: 'concepto',
+    valorActual: valorConceptoActual, onGuardado: onClasificadoConcepto,
+  })
+
+  const labelActual = valorActual?.label ?? ''
+  const rowBg = isEven ? 'bg-[#f8f9fc]' : ''
+
+  return (
+    <tr className={`border-t border-[#f0f2f8] hover:bg-[#F0F7F6] transition-colors ${rowBg}`}>
+      <td className="px-4 py-3 w-10">
+        <input
+          type="checkbox"
+          checked={seleccionada}
+          onChange={() => onToggleSeleccion(fila.indice)}
+          className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer"
+        />
+      </td>
+      <td className="px-4 py-3 text-sm text-[#6b7280] whitespace-nowrap">
+        {formatFecha(fila.fechaEmision)}
+      </td>
+      <td className="px-4 py-3">
+        <span className="text-sm text-[#191c1e]" title={fila.nombreEmisor ?? ''}>
+          {truncate(fila.nombreEmisor, 40)}
+        </span>
+        <div className="text-[11px] text-[#8890b5] mt-0.5">{fila.nitEmisor}</div>
+      </td>
+      <td className="px-4 py-3 text-sm font-semibold text-[#191c1e] text-right tabular-nums whitespace-nowrap">
+        {formatCOP(getBase(fila))}
+      </td>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-0">
+          <select
+            value={labelActual}
+            onChange={handleChange}
+            className="text-sm border border-[#d1d5db] rounded-lg px-2.5 py-1.5 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer min-w-[200px]"
+          >
+            <option value="">— Seleccionar —</option>
+            {OPCIONES.map((o) => (
+              <option key={o.label} value={o.label}>{o.label}</option>
+            ))}
+          </select>
+          <SaveIndicator estado={guardadoEstado} />
+        </div>
+        {error && (
+          <div className="mt-1 flex items-center gap-2">
+            <span className="text-[11px] text-red-500">{error}</span>
+            <button
+              onClick={handleRetry}
+              className="text-[11px] text-[#003B43] underline hover:no-underline"
+            >
+              Reintentar
+            </button>
+          </div>
+        )}
+      </td>
+      {empresaId && (
+        <>
+          <td className="px-4 py-3">
+            <div className="flex items-center gap-0">
+              <select
+                value={valorIvaActual ?? ''}
+                onChange={iva.handleChange}
+                className="text-sm border border-[#d1d5db] rounded-lg px-2.5 py-1.5 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer min-w-[150px]"
+              >
+                <option value="">— Seleccionar —</option>
+                {CLASES_IVA.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+              <SaveIndicator estado={iva.guardadoEstado} />
+            </div>
+            {iva.error && (
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-[11px] text-red-500">{iva.error}</span>
+                <button onClick={iva.handleRetry} className="text-[11px] text-[#003B43] underline hover:no-underline">
+                  Reintentar
+                </button>
+              </div>
+            )}
+          </td>
+          <td className="px-4 py-3">
+            <div className="flex items-center gap-0">
+              <select
+                value={valorConceptoActual ?? ''}
+                onChange={concepto.handleChange}
+                className="text-sm border border-[#d1d5db] rounded-lg px-2.5 py-1.5 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer min-w-[170px]"
+              >
+                <option value="">— Seleccionar —</option>
+                {CONCEPTOS.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+              <SaveIndicator estado={concepto.guardadoEstado} />
+            </div>
+            {concepto.error && (
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-[11px] text-red-500">{concepto.error}</span>
+                <button onClick={concepto.handleRetry} className="text-[11px] text-[#003B43] underline hover:no-underline">
+                  Reintentar
+                </button>
+              </div>
+            )}
+          </td>
+        </>
+      )}
+    </tr>
+  )
+}
+
+// ── página principal ───────────────────────────────────────────────────────────
+export default function DianClasificacionPage() {
+  const { borradorId } = useParams()
+  const navigate = useNavigate()
+
+  // La página carga su estado SIEMPRE desde el backend (no desde el state de navegación de
+  // React Router): así, "volver" desde Nómina, un F5 accidental, o abrir el enlace de nuevo
+  // muestran lo que de verdad está guardado, en vez de una foto vieja del momento en que se
+  // salió de esta pantalla. Cada fila ya se autoguarda individualmente al clasificarla (ver
+  // FilaClasificacion) — lo único que faltaba era releerlas al volver a entrar.
+  const [cargando, setCargando]           = useState(true)
+  const [errorCarga, setErrorCarga]       = useState('')
+  const [filasParaClasificar, setFilasParaClasificar] = useState([])
+  // Con empresa asociada, el borrador exige clasificar también IVA y Concepto para poder
+  // exportar (ver dianController.js#exportarBorrador) — sin empresa, se comporta igual que
+  // antes de este cambio (solo retención).
+  const [empresaId, setEmpresaId]         = useState(null)
+  const [empresaNombre, setEmpresaNombre] = useState(null)
+  // Tipos de documento del reporte que NO están en TIPOS_CONTABILIZADOS ni en la lista de
+  // exclusiones conocidas (Application response / Nómina Individual) — antes esto solo se
+  // veía si alguien abría la hoja METADATOS del Excel exportado. Filtra a esConocido=false:
+  // los excluidos conocidos son esperados, no ameritan alarma en pantalla.
+  const [documentosNoReconocidos, setDocumentosNoReconocidos] = useState([])
+  // Meses de este reporte que ya tienen documentos guardados para esta empresa — mismo
+  // chequeo que dianController.js#guardarDocumentosPermanentes hace al exportar, expuesto acá
+  // temprano (apenas se abre esta pantalla) para no hacer clasificar un reporte entero antes
+  // de avisar que ese mes ya existía. Es solo informativo: la elección de actualizar/reemplazar
+  // sigue siendo al exportar, en DianExportacionPage.jsx.
+  const [periodosExistentes, setPeriodosExistentes] = useState([])
+  // Filas con relevancia contable pero sin fecha de emisión utilizable (ausente o en un formato
+  // que el backend no pudo convertir a ISO) — sin esto la fila no se puede ubicar en ningún mes
+  // calendario y queda fuera del guardado permanente en silencio (ver agruparFilasPorPeriodo en
+  // dianController.js). Pedido explícito del usuario (2026-09-12).
+  const [filasSinFecha, setFilasSinFecha] = useState([])
+  // Filas con relevancia contable pero sin CUFE/CUDE — sin esa llave natural no hay forma de
+  // identificar el documento entre subidas (ver guardarDocumentosPermanentes en
+  // dianController.js) y queda fuera del guardado permanente en silencio.
+  const [filasSinCufe, setFilasSinCufe] = useState([])
+
+  useEffect(() => {
+    let cancelado = false
+    setCargando(true)
+    setErrorCarga('')
+    api.getDianBorrador(borradorId)
+      .then((data) => {
+        if (cancelado) return
+        setFilasParaClasificar(data.filasParaClasificar ?? [])
+        setEmpresaId(data.empresaId ?? null)
+        setEmpresaNombre(data.empresaNombre ?? null)
+        setDocumentosNoReconocidos((data.documentosNoContabilizados ?? []).filter((d) => !d.esConocido))
+        setPeriodosExistentes(data.periodosExistentes ?? [])
+        setFilasSinFecha(data.filasSinFecha ?? [])
+        setFilasSinCufe(data.filasSinCufe ?? [])
+      })
+      .catch((err) => {
+        if (cancelado) return
+        setErrorCarga(err.message || 'No se pudo cargar el borrador')
+      })
+      .finally(() => {
+        if (!cancelado) setCargando(false)
+      })
+    return () => { cancelado = true }
+  }, [borradorId])
+
+  // Solo las compras reales piden clasificación de retención (ver requiereClasificacion
+  // en el backend) — no toda fila "Recibido". Notas de crédito, "Documento soporte con no
+  // obligados" y notas de ajuste no cuentan como compra y no deben bloquear esta pantalla.
+  const filasRecibido = useMemo(() =>
+    filasParaClasificar.filter((f) => f.requiereClasificacion),
+    [filasParaClasificar]
+  )
+
+  // Mes(es) que cubre este reporte (compras + ventas, no solo lo que pide clasificación) —
+  // pedido del usuario: apenas se sube el Excel y se entra a esta pantalla, saber de un
+  // vistazo en qué mes se está trabajando, o si el reporte mezcla varios.
+  const mesesDelReporte = useMemo(() => {
+    const vistos = new Set()
+    for (const f of filasParaClasificar) {
+      if (!f.fechaEmision) continue
+      vistos.add(f.fechaEmision.slice(0, 7)) // "YYYY-MM"
+    }
+    return Array.from(vistos).sort().map((ym) => {
+      const [anio, mes] = ym.split('-').map(Number)
+      return { anio, mes }
+    })
+  }, [filasParaClasificar])
+
+  // ── filtros estilo Excel (checklist de valores por columna) ─────────────────
+  // null = sin filtro (se muestran todas); Set = solo se muestran los valores marcados
+  const [filtroFecha,  setFiltroFecha]  = useState(null)
+  const [filtroEmisor, setFiltroEmisor] = useState(null)
+  const [filtroTotal,  setFiltroTotal]  = useState(null)
+
+  // { columna: 'fecha' | 'emisor' | 'total', rect: DOMRect } | null
+  const [filtroPopover, setFiltroPopover] = useState(null)
+  const btnFechaRef  = useRef(null)
+  const btnEmisorRef = useRef(null)
+  const btnTotalRef  = useRef(null)
+
+  const abrirFiltro = useCallback((columna, btnRef) => {
+    setFiltroPopover((prev) => {
+      if (prev?.columna === columna) return null
+      return { columna, rect: btnRef.current.getBoundingClientRect() }
+    })
+  }, [])
+
+  const cerrarFiltro = useCallback(() => setFiltroPopover(null), [])
+
+  // Reposicionar el menú (en vez de cerrarlo) si el usuario hace scroll o
+  // redimensiona la ventana mientras está abierto, para que siga el ícono.
+  useEffect(() => {
+    const columna = filtroPopover?.columna
+    if (!columna) return
+    const refsPorColumna = { fecha: btnFechaRef, emisor: btnEmisorRef, total: btnTotalRef }
+    const actualizarPosicion = () => {
+      const btnRef = refsPorColumna[columna]
+      if (!btnRef?.current) return
+      setFiltroPopover((prev) => (prev ? { ...prev, rect: btnRef.current.getBoundingClientRect() } : prev))
+    }
+    window.addEventListener('scroll', actualizarPosicion, true)
+    window.addEventListener('resize', actualizarPosicion)
+    return () => {
+      window.removeEventListener('scroll', actualizarPosicion, true)
+      window.removeEventListener('resize', actualizarPosicion)
+    }
+  }, [filtroPopover?.columna])
+
+  const hayFiltrosActivos = filtroFecha !== null || filtroEmisor !== null || filtroTotal !== null
+
+  const claseIconoFiltro = (activo) =>
+    `material-symbols-outlined text-[15px] rounded-full p-1 leading-none transition-colors ${
+      activo
+        ? 'bg-[#003B43] text-[#ffffff] shadow-sm'
+        : 'bg-[#e2e4ef] text-[#5b6178] hover:bg-[#E3EEEE] hover:text-[#003B43]'
+    }`
+
+  const limpiarFiltros = useCallback(() => {
+    setFiltroFecha(null)
+    setFiltroEmisor(null)
+    setFiltroTotal(null)
+  }, [])
+
+  const valoresFecha = useMemo(() => {
+    const unicos = Array.from(new Set(filasRecibido.map((f) => f.fechaEmision).filter(Boolean))).sort()
+    return unicos.map((iso) => ({ value: iso, label: formatFecha(iso) }))
+  }, [filasRecibido])
+
+  const valoresEmisor = useMemo(() => {
+    const unicos = Array.from(new Set(filasRecibido.map((f) => f.nombreEmisor).filter(Boolean)))
+      .sort((a, b) => a.localeCompare(b, 'es'))
+    return unicos.map((n) => ({ value: n, label: n }))
+  }, [filasRecibido])
+
+  const valoresTotal = useMemo(() => {
+    const unicos = Array.from(new Set(filasRecibido.filter((f) => f.total != null).map(getBase))).sort((a, b) => a - b)
+    return unicos.map((t) => ({ value: t, label: formatCOP(t) }))
+  }, [filasRecibido])
+
+  const filasFiltradas = useMemo(() =>
+    filasRecibido.filter((f) => {
+      if (filtroFecha  !== null && !filtroFecha.has(f.fechaEmision)) return false
+      if (filtroEmisor !== null && !filtroEmisor.has(f.nombreEmisor)) return false
+      if (filtroTotal  !== null && !filtroTotal.has(getBase(f))) return false
+      return true
+    }),
+    [filasRecibido, filtroFecha, filtroEmisor, filtroTotal]
+  )
+
+  // ── orden por Fecha o Base (asc/desc) — independiente de los filtros ───────────
+  const [ordenColumna,   setOrdenColumna]   = useState(null)   // 'fecha' | 'total' | null
+  const [ordenDireccion, setOrdenDireccion] = useState('asc')  // 'asc' | 'desc'
+
+  const toggleOrden = useCallback((columna) => {
+    if (ordenColumna !== columna) {
+      setOrdenColumna(columna)
+      setOrdenDireccion('asc')
+    } else if (ordenDireccion === 'asc') {
+      setOrdenDireccion('desc')
+    } else {
+      setOrdenColumna(null)
+    }
+  }, [ordenColumna, ordenDireccion])
+
+  const filasOrdenadas = useMemo(() => {
+    if (!ordenColumna) return filasFiltradas
+    const factor = ordenDireccion === 'asc' ? 1 : -1
+    return [...filasFiltradas].sort((a, b) => {
+      const av = ordenColumna === 'fecha' ? a.fechaEmision : getBase(a)
+      const bv = ordenColumna === 'fecha' ? b.fechaEmision : getBase(b)
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (av < bv) return -factor
+      if (av > bv) return factor
+      return 0
+    })
+  }, [filasFiltradas, ordenColumna, ordenDireccion])
+
+  const iconoOrden = (columna) => {
+    if (ordenColumna !== columna) return 'unfold_more'
+    return ordenDireccion === 'asc' ? 'arrow_upward' : 'arrow_downward'
+  }
+
+  // Estado local: indice → opcion | null. Se recalcula cada vez que llega un fetch nuevo de
+  // filasRecibido (carga inicial o cambio de borradorId) — no en cada render, para no pisar
+  // ediciones locales que el usuario todavía no ha visto confirmadas por el autoguardado.
+  const [clasificaciones, setClasificaciones] = useState({})
+
+  useEffect(() => {
+    setClasificaciones(
+      Object.fromEntries(
+        filasRecibido.map((f) => {
+          if (f.clasificacionRetencion) {
+            const opcion = OPCIONES.find(
+              (o) => o.clasificacion === f.clasificacionRetencion && o.tasa === (f.tasaRetencion ?? null)
+            ) ?? null
+            return [f.indice, opcion]
+          }
+          return [f.indice, null]
+        })
+      )
+    )
+  }, [filasRecibido])
+
+  // indice → valor de texto simple (o null) — mismo criterio que clasificaciones de arriba,
+  // pero sin el emparejamiento con tasa que sí necesita la retención.
+  const [clasificacionesIva, setClasificacionesIva] = useState({})
+  const [conceptos, setConceptos] = useState({})
+
+  useEffect(() => {
+    setClasificacionesIva(Object.fromEntries(filasRecibido.map((f) => [f.indice, f.clasificacionIva ?? null])))
+    setConceptos(Object.fromEntries(filasRecibido.map((f) => [f.indice, f.concepto ?? null])))
+  }, [filasRecibido])
+
+  const handleClasificadoIva = useCallback((indice, valor) => {
+    setClasificacionesIva((prev) => ({ ...prev, [indice]: valor }))
+  }, [])
+  const handleClasificadoConcepto = useCallback((indice, valor) => {
+    setConceptos((prev) => ({ ...prev, [indice]: valor }))
+  }, [])
+
+  // ── clasificación rápida ───────────────────────────────────────────────────
+  const [clasificacionRapida, setClasificacionRapida] = useState('')
+  const [cargandoRapida,      setCargandoRapida]      = useState(false)
+  const [toastRapido,         setToastRapido]         = useState(null) // { tipo:'exito'|'error', msg }
+  const toastTimerRef = useRef(null)
+
+  const mostrarToast = useCallback((tipo, msg) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    setToastRapido({ tipo, msg })
+    toastTimerRef.current = setTimeout(() => setToastRapido(null), tipo === 'exito' ? 3000 : 5000)
+  }, [])
+
+  const handleAplicarRapida = useCallback(async () => {
+    const opcion = OPCIONES.find((o) => o.label === clasificacionRapida)
+    if (!opcion) return
+    setCargandoRapida(true)
+    setToastRapido(null)
+    try {
+      const { filasActualizadas } = await api.patchDianClasificacionRapida(borradorId, {
+        clasificacionRetencion: opcion.clasificacion,
+        tasaRetencion:          opcion.tasa,
+      })
+      // Actualizar estado local: todas las filas null pasan al nuevo valor
+      setClasificaciones((prev) => {
+        const next = { ...prev }
+        for (const [indice, val] of Object.entries(next)) {
+          if (val == null) next[indice] = opcion
+        }
+        return next
+      })
+      if (filasActualizadas > 0) {
+        mostrarToast('exito', `${filasActualizadas} ${filasActualizadas === 1 ? 'fila clasificada' : 'filas clasificadas'}`)
+      } else {
+        mostrarToast('exito', 'No había filas sin clasificar')
+      }
+    } catch (err) {
+      mostrarToast('error', err.message || 'Error al aplicar clasificación')
+    } finally {
+      setCargandoRapida(false)
+    }
+  }, [clasificacionRapida, borradorId, mostrarToast])
+
+  const handleClasificado = useCallback((indice, opcion) => {
+    setClasificaciones((prev) => ({ ...prev, [indice]: opcion }))
+  }, [])
+
+  // ── clasificación rápida — IVA y Concepto (mismo patrón que la de retención arriba,
+  // pero con valor de texto simple en vez de par clasificación+tasa) ─────────────────
+  const [clasificacionRapidaIva, setClasificacionRapidaIva] = useState('')
+  const [cargandoRapidaIva, setCargandoRapidaIva] = useState(false)
+  const sinIvaCount = filasRecibido.filter((f) => clasificacionesIva[f.indice] == null).length
+
+  const handleAplicarRapidaIva = useCallback(async () => {
+    if (!clasificacionRapidaIva) return
+    setCargandoRapidaIva(true)
+    setToastRapido(null)
+    try {
+      const { filasActualizadas } = await api.patchDianClasificacionRapida(borradorId, {
+        campo: 'clasificacionIva', clasificacionIva: clasificacionRapidaIva,
+      })
+      setClasificacionesIva((prev) => {
+        const next = { ...prev }
+        for (const [indice, val] of Object.entries(next)) if (val == null) next[indice] = clasificacionRapidaIva
+        return next
+      })
+      mostrarToast('exito', filasActualizadas > 0
+        ? `${filasActualizadas} ${filasActualizadas === 1 ? 'fila clasificada' : 'filas clasificadas'} (IVA)`
+        : 'No había filas sin clasificar')
+    } catch (err) {
+      mostrarToast('error', err.message || 'Error al aplicar clasificación de IVA')
+    } finally {
+      setCargandoRapidaIva(false)
+    }
+  }, [clasificacionRapidaIva, borradorId, mostrarToast])
+
+  const [clasificacionRapidaConcepto, setClasificacionRapidaConcepto] = useState('')
+  const [cargandoRapidaConcepto, setCargandoRapidaConcepto] = useState(false)
+  const sinConceptoCount = filasRecibido.filter((f) => conceptos[f.indice] == null).length
+
+  const handleAplicarRapidaConcepto = useCallback(async () => {
+    if (!clasificacionRapidaConcepto) return
+    setCargandoRapidaConcepto(true)
+    setToastRapido(null)
+    try {
+      const { filasActualizadas } = await api.patchDianClasificacionRapida(borradorId, {
+        campo: 'concepto', concepto: clasificacionRapidaConcepto,
+      })
+      setConceptos((prev) => {
+        const next = { ...prev }
+        for (const [indice, val] of Object.entries(next)) if (val == null) next[indice] = clasificacionRapidaConcepto
+        return next
+      })
+      mostrarToast('exito', filasActualizadas > 0
+        ? `${filasActualizadas} ${filasActualizadas === 1 ? 'fila clasificada' : 'filas clasificadas'} (Concepto)`
+        : 'No había filas sin clasificar')
+    } catch (err) {
+      mostrarToast('error', err.message || 'Error al aplicar concepto')
+    } finally {
+      setCargandoRapidaConcepto(false)
+    }
+  }, [clasificacionRapidaConcepto, borradorId, mostrarToast])
+
+  // Contadores — la retención por sí sola sigue gobernando la "Clasificación rápida" y el
+  // contador de esa tarjeta; filaCompleta (usada por el botón Continuar y la barra de
+  // progreso) exige además IVA y Concepto, pero solo cuando el borrador tiene empresa.
+  const sinClasificarCount = filasRecibido.filter((f) => clasificaciones[f.indice] == null).length
+
+  const filaCompleta = useCallback((f) =>
+    clasificaciones[f.indice] != null &&
+    (!empresaId || (clasificacionesIva[f.indice] != null && conceptos[f.indice] != null)),
+    [clasificaciones, clasificacionesIva, conceptos, empresaId]
+  )
+  const completasCount = filasRecibido.filter(filaCompleta).length
+  const todasClasificadas = filasRecibido.length > 0 && completasCount === filasRecibido.length
+
+  // ── selección múltiple ───────────────────────────────────────────────────
+  const [seleccionadas, setSeleccionadas] = useState(() => new Set())
+  const [clasificacionSeleccion, setClasificacionSeleccion] = useState('')
+  const [aplicandoSeleccion, setAplicandoSeleccion] = useState(false)
+
+  const toggleSeleccion = useCallback((indice) => {
+    setSeleccionadas((prev) => {
+      const next = new Set(prev)
+      if (next.has(indice)) next.delete(indice)
+      else next.add(indice)
+      return next
+    })
+  }, [])
+
+  const todasVisiblesSeleccionadas =
+    filasFiltradas.length > 0 && filasFiltradas.every((f) => seleccionadas.has(f.indice))
+
+  const toggleSeleccionarTodasVisibles = useCallback(() => {
+    setSeleccionadas((prev) => {
+      const next = new Set(prev)
+      const marcarTodas = !(filasFiltradas.length > 0 && filasFiltradas.every((f) => next.has(f.indice)))
+      for (const f of filasFiltradas) {
+        if (marcarTodas) next.add(f.indice)
+        else next.delete(f.indice)
+      }
+      return next
+    })
+  }, [filasFiltradas])
+
+  const handleAplicarSeleccion = useCallback(async () => {
+    const opcion = OPCIONES.find((o) => o.label === clasificacionSeleccion)
+    if (!opcion || seleccionadas.size === 0) return
+    const indices = Array.from(seleccionadas)
+    setAplicandoSeleccion(true)
+    setToastRapido(null)
+    try {
+      await Promise.all(
+        indices.map((indice) =>
+          api.patchDianBorrador(borradorId, {
+            indice,
+            clasificacionRetencion: opcion.clasificacion,
+            tasaRetencion:          opcion.tasa,
+          })
+        )
+      )
+      setClasificaciones((prev) => {
+        const next = { ...prev }
+        for (const indice of indices) next[indice] = opcion
+        return next
+      })
+      setSeleccionadas(new Set())
+      setClasificacionSeleccion('')
+      mostrarToast('exito', `${indices.length} ${indices.length === 1 ? 'fila clasificada' : 'filas clasificadas'}`)
+    } catch (err) {
+      mostrarToast('error', err.message || 'Error al aplicar clasificación a la selección')
+    } finally {
+      setAplicandoSeleccion(false)
+    }
+  }, [clasificacionSeleccion, seleccionadas, borradorId, mostrarToast])
+
+  // ── botón flotante: ir hacia abajo ───────────────────────────────────────
+  const pieRef = useRef(null)
+  const [mostrarBajar, setMostrarBajar] = useState(false)
+
+  useEffect(() => {
+    const onScroll = () => {
+      const distanciaAlFinal =
+        document.documentElement.scrollHeight - window.scrollY - window.innerHeight
+      setMostrarBajar(distanciaAlFinal > 200)
+    }
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll)
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+    }
+  }, [])
+
+  const irAlFinal = useCallback(() => {
+    pieRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [])
+
+  if (cargando) {
+    return (
+      <Cargando texto="Cargando borrador…" />
+    )
+  }
+
+  if (errorCarga) {
+    return (
+      <div className="max-w-lg mx-auto mt-20 text-center">
+        <span className="material-symbols-outlined text-5xl text-[#d1d5db]">error_outline</span>
+        <p className="mt-4 text-[#6b7280]">{errorCarga}</p>
+        <button
+          onClick={() => navigate('/dian/upload')}
+          className="mt-6 px-5 py-2.5 rounded-xl text-sm font-semibold text-[#ffffff] hover:opacity-90 transition active:scale-[0.97]"
+          style={{ background: '#003B43' }}
+        >
+          Subir otro reporte
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto">
+      {/* ── encabezado ─────────────────────────────────────────────────────── */}
+      <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-[#191c1e]">
+            {empresaId ? 'Clasificación de compras' : 'Clasificación de retención'}
+          </h1>
+          <p className="mt-1 text-sm text-[#6b7280]">
+            {empresaId
+              ? 'Selecciona retención, IVA y concepto para cada compra recibida.'
+              : 'Selecciona el tipo de retención para cada compra recibida.'}
+          </p>
+        </div>
+        {empresaNombre && (
+          <div className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#E3EEEE] border-2 border-[#003B43]/30 flex-shrink-0">
+            <span className="material-symbols-outlined text-[#003B43] text-lg">business</span>
+            <span className="text-sm font-semibold text-[#003B43]">{empresaNombre}</span>
+          </div>
+        )}
+      </div>
+
+      {/* ── Mes(es) de este reporte — informativo, no es una alerta (por eso el mismo azul
+          que el resto de la app, no ámbar). Antes no había forma de saber de un vistazo en
+          qué mes se estaba trabajando al entrar acá recién subido el Excel. ─────────────── */}
+      {mesesDelReporte.length > 0 && (
+        <div className="mb-5 flex items-center gap-3 px-4 py-3 rounded-xl bg-[#E3EEEE] border-2 border-[#003B43]/30">
+          <span className="material-symbols-outlined text-[#191c1e] text-xl flex-shrink-0">calendar_month</span>
+          <p className="text-sm text-[#191c1e]">
+            {mesesDelReporte.length === 1 ? (
+              <>Estás trabajando en <span className="font-semibold">{MESES_ES[mesesDelReporte[0].mes - 1]} {mesesDelReporte[0].anio}</span></>
+            ) : (
+              <>
+                Este reporte abarca <span className="font-semibold">{mesesDelReporte.length} meses</span>:{' '}
+                {mesesDelReporte.map((p, i) => (
+                  <span key={`${p.anio}-${p.mes}`} className="font-semibold">
+                    {MESES_ES[p.mes - 1]} {p.anio}{i < mesesDelReporte.length - 1 ? ', ' : ''}
+                  </span>
+                ))}
+              </>
+            )}
+          </p>
+        </div>
+      )}
+
+      {/* ── Meses ya guardados para esta empresa — aviso temprano, antes de invertir tiempo
+          clasificando un reporte que de todos modos va a pedir elegir actualizar/reemplazar
+          al exportar (ver DianExportacionPage.jsx). No bloquea nada acá. ─────────────────── */}
+      {periodosExistentes.length > 0 && (
+        <div className="mb-5 flex items-start gap-3 p-4 rounded-xl bg-[#fecaca]">
+          <span className="material-symbols-outlined text-[#dc2626] text-xl flex-shrink-0 mt-0.5">history</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-[#dc2626]">
+              Ya hay datos guardados para {periodosExistentes.length === 1 ? 'este mes' : 'estos meses'} de esta empresa
+            </p>
+            <div className="mt-1 space-y-0.5">
+              {periodosExistentes.map((p) => (
+                <p key={`${p.anio}-${p.mes}`} className="text-xs text-[#dc2626]/80">
+                  {MESES_ES[p.mes - 1]} {p.anio}: {p.existentes} ya guardada{p.existentes !== 1 ? 's' : ''}, {p.enElReporte} en este reporte
+                </p>
+              ))}
+            </div>
+            <p className="text-xs text-[#dc2626]/80 mt-1.5">
+              Puedes seguir clasificando; al exportar podrás elegir actualizar o reemplazar esos meses.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Filas sin fecha de emisión utilizable — no se pueden ubicar en ningún mes
+          calendario, así que quedan fuera del guardado permanente en silencio si hay
+          empresa asociada. No bloquea nada, es solo para que se note antes de exportar. ── */}
+      {filasSinFecha.length > 0 && (
+        <div className="mb-5 flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-[#003B43]/40">
+          <span className="material-symbols-outlined text-[#003B43] text-xl flex-shrink-0 mt-0.5">event_busy</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-[#003B43]">
+              {filasSinFecha.length === 1
+                ? 'Hay una fila sin fecha de emisión utilizable'
+                : `Hay ${filasSinFecha.length} filas sin fecha de emisión utilizable`}
+            </p>
+            <p className="text-xs text-[#003B43]/80 mt-0.5">
+              {empresaId
+                ? 'No se puede determinar a qué mes pertenecen — no quedarán guardadas en el consolidado mensual de esta empresa.'
+                : 'No se puede determinar a qué mes pertenecen — revisa el archivo original si esperabas que se contabilizaran por mes.'}
+            </p>
+            <ul className="mt-2 flex flex-col gap-1">
+              {filasSinFecha.map((f, i) => (
+                <li key={i} className="text-xs text-[#003B43]">
+                  <b>{f.tipoDocumento ?? '(sin tipo)'}</b> {f.prefijo}{f.folio ?? ''} — fecha: {f.fechaEmisionCruda ? `"${f.fechaEmisionCruda}"` : '(vacía)'}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* ── Filas sin CUFE/CUDE — sin esa llave natural no hay forma de identificar el
+          documento entre subidas, así que quedan fuera del guardado permanente en silencio
+          si hay empresa asociada. No bloquea nada, es solo para que se note antes de exportar. ── */}
+      {filasSinCufe.length > 0 && (
+        <div className="mb-5 flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-[#003B43]/40">
+          <span className="material-symbols-outlined text-[#003B43] text-xl flex-shrink-0 mt-0.5">tag</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-[#003B43]">
+              {filasSinCufe.length === 1
+                ? 'Hay una fila sin CUFE/CUDE'
+                : `Hay ${filasSinCufe.length} filas sin CUFE/CUDE`}
+            </p>
+            <p className="text-xs text-[#003B43]/80 mt-0.5">
+              {empresaId
+                ? 'No se pueden identificar de forma única entre subidas — no quedarán guardadas en el consolidado mensual de esta empresa.'
+                : 'No se pueden identificar de forma única entre subidas — revisa el archivo original si esperabas que trajeran CUFE/CUDE.'}
+            </p>
+            <ul className="mt-2 flex flex-col gap-1">
+              {filasSinCufe.map((f, i) => (
+                <li key={i} className="text-xs text-[#003B43]">
+                  <b>{f.tipoDocumento ?? '(sin tipo)'}</b> {f.prefijo}{f.folio ?? ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* ── Documentos con tipo no reconocido — antes solo se veía en la hoja METADATOS
+          del Excel exportado, fácil de no abrir nunca. No bloquea nada (esos documentos
+          ya quedaron fuera de todos los cálculos), es solo para que no pase desapercibido
+          un tipo de documento nuevo que la DIAN empezó a usar. ─────────────────────── */}
+      {documentosNoReconocidos.length > 0 && (
+        <div className="mb-5 flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-[#003B43]/40">
+          <span className="material-symbols-outlined text-[#003B43] text-xl flex-shrink-0 mt-0.5">warning</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-[#003B43]">
+              {documentosNoReconocidos.length === 1
+                ? 'Este reporte trae un tipo de documento que no se reconoce'
+                : `Este reporte trae ${documentosNoReconocidos.length} tipos de documento que no se reconocen`}
+            </p>
+            <p className="text-xs text-[#003B43]/80 mt-0.5">
+              No entraron en ningún cálculo (ni compras, ni ventas, ni notas) — revisar si hace falta clasificarlos aparte.
+            </p>
+            <ul className="mt-2 flex flex-col gap-1">
+              {documentosNoReconocidos.map((d) => (
+                <li key={d.tipo} className="text-xs text-[#003B43]">
+                  <b>{d.tipo}</b> — {d.cantidad} {d.cantidad === 1 ? 'documento' : 'documentos'}, {formatCOP(d.total)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {filasRecibido.length === 0 ? (
+        /* ── estado vacío ──────────────────────────────────────────────────── */
+        <div className="bg-white rounded-2xl border border-[#e2e4ef] p-12 text-center shadow-sm">
+          <span className="material-symbols-outlined text-5xl text-[#d1d5db]">check_circle</span>
+          <p className="mt-4 text-[#6b7280]">
+            No hay compras que clasificar en este reporte.
+          </p>
+          <button
+            onClick={() => navigate(`/dian/nomina/${borradorId}`)}
+            className="mt-6 px-5 py-2.5 rounded-xl text-sm font-semibold text-[#ffffff] hover:opacity-90 transition active:scale-[0.97]"
+            style={{ background: '#003B43' }}
+          >
+            Ir a nómina
+          </button>
+        </div>
+      ) : (
+        <>
+          {/* ── clasificación rápida — una sola tarjeta, una fila por campo ── */}
+          <div className="bg-white rounded-2xl border border-[#e2e4ef] shadow-sm p-5 mb-5">
+            <h2 className="text-xs font-bold text-[#8890b5] uppercase tracking-wide mb-1">
+              Clasificación rápida
+            </h2>
+            <p className="text-xs text-[#9ca3af] mb-3">
+              Aplica un valor a todas las filas que aún no tengan ese campo asignado.
+            </p>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-x-8 gap-y-4">
+              {/* Retención */}
+              <div>
+                <label className="block text-xs font-semibold text-[#6b7280] mb-1.5">Retención</label>
+                <select
+                  value={clasificacionRapida}
+                  onChange={(e) => setClasificacionRapida(e.target.value)}
+                  disabled={cargandoRapida || sinClasificarCount === 0}
+                  className="w-full text-sm border border-[#d1d5db] rounded-lg px-3 py-2 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <option value="">— Seleccionar —</option>
+                  {OPCIONES.map((o) => (
+                    <option key={o.label} value={o.label}>{o.label}</option>
+                  ))}
+                </select>
+                <div className="flex items-center justify-between gap-2 mt-2.5">
+                  <button
+                    onClick={handleAplicarRapida}
+                    disabled={!clasificacionRapida || cargandoRapida || sinClasificarCount === 0}
+                    className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-[#ffffff] transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+                    style={{ background: '#003B43' }}
+                  >
+                    {cargandoRapida ? (
+                      <>
+                        <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        <span>Aplicando…</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="material-symbols-outlined text-base">bolt</span>
+                        <span>Aplicar</span>
+                      </>
+                    )}
+                  </button>
+                  <span className={`text-xs font-medium text-right ${sinClasificarCount === 0 ? 'text-green-600' : 'text-[#6b7280]'}`}>
+                    {sinClasificarCount === 0 ? '✓ Todas clasificadas' : `${sinClasificarCount} sin asignar`}
+                  </span>
+                </div>
+              </div>
+
+              {/* IVA y Concepto — solo si hay empresa asociada */}
+              {empresaId && (
+                <>
+                  <div>
+                    <label className="block text-xs font-semibold text-[#6b7280] mb-1.5">IVA</label>
+                    <select
+                      value={clasificacionRapidaIva}
+                      onChange={(e) => setClasificacionRapidaIva(e.target.value)}
+                      disabled={cargandoRapidaIva || sinIvaCount === 0}
+                      className="w-full text-sm border border-[#d1d5db] rounded-lg px-3 py-2 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <option value="">— Seleccionar —</option>
+                      {CLASES_IVA.map((v) => (
+                        <option key={v} value={v}>{v}</option>
+                      ))}
+                    </select>
+                    <div className="flex items-center justify-between gap-2 mt-2.5">
+                      <button
+                        onClick={handleAplicarRapidaIva}
+                        disabled={!clasificacionRapidaIva || cargandoRapidaIva || sinIvaCount === 0}
+                        className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-[#ffffff] transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ background: '#003B43' }}
+                      >
+                        <span className="material-symbols-outlined text-base">bolt</span>
+                        {cargandoRapidaIva ? 'Aplicando…' : 'Aplicar'}
+                      </button>
+                      <span className={`text-xs font-medium text-right ${sinIvaCount === 0 ? 'text-green-600' : 'text-[#6b7280]'}`}>
+                        {sinIvaCount === 0 ? '✓ Todas clasificadas' : `${sinIvaCount} sin asignar`}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-[#6b7280] mb-1.5">Concepto</label>
+                    <select
+                      value={clasificacionRapidaConcepto}
+                      onChange={(e) => setClasificacionRapidaConcepto(e.target.value)}
+                      disabled={cargandoRapidaConcepto || sinConceptoCount === 0}
+                      className="w-full text-sm border border-[#d1d5db] rounded-lg px-3 py-2 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <option value="">— Seleccionar —</option>
+                      {CONCEPTOS.map((v) => (
+                        <option key={v} value={v}>{v}</option>
+                      ))}
+                    </select>
+                    <div className="flex items-center justify-between gap-2 mt-2.5">
+                      <button
+                        onClick={handleAplicarRapidaConcepto}
+                        disabled={!clasificacionRapidaConcepto || cargandoRapidaConcepto || sinConceptoCount === 0}
+                        className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-[#ffffff] transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ background: '#003B43' }}
+                      >
+                        <span className="material-symbols-outlined text-base">bolt</span>
+                        {cargandoRapidaConcepto ? 'Aplicando…' : 'Aplicar'}
+                      </button>
+                      <span className={`text-xs font-medium text-right ${sinConceptoCount === 0 ? 'text-green-600' : 'text-[#6b7280]'}`}>
+                        {sinConceptoCount === 0 ? '✓ Todos asignados' : `${sinConceptoCount} sin asignar`}
+                      </span>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Toast — compartido por los tres campos */}
+            {toastRapido && (
+              <div className={`mt-4 flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-sm font-medium
+                ${toastRapido.tipo === 'exito'
+                  ? 'bg-green-50 text-green-700 border border-green-200'
+                  : 'bg-red-50 text-red-700 border border-red-200'
+                }`}
+              >
+                <span className="material-symbols-outlined text-base flex-shrink-0">
+                  {toastRapido.tipo === 'exito' ? 'check_circle' : 'error'}
+                </span>
+                {toastRapido.tipo === 'exito' ? '✓ ' : ''}{toastRapido.msg}
+              </div>
+            )}
+          </div>
+
+          {/* ── resumen de filtros activos ───────────────────────────────── */}
+          {hayFiltrosActivos && (
+            <div className="flex items-center justify-between mb-4 px-1">
+              <p className="text-xs text-[#8890b5]">
+                Mostrando <span className="font-semibold text-[#191c1e]">{filasFiltradas.length}</span> de {filasRecibido.length} compras (filtros activos)
+              </p>
+              <button
+                onClick={limpiarFiltros}
+                className="text-xs font-medium text-[#003B43] hover:underline"
+              >
+                Limpiar filtros
+              </button>
+            </div>
+          )}
+
+          {/* ── barra de selección múltiple ──────────────────────────────── */}
+          {seleccionadas.size > 0 && (
+            <div className="bg-[#E3EEEE] border border-[#003B43]/30 rounded-2xl shadow-sm p-4 mb-5 flex items-center gap-3 flex-wrap">
+              <span className="text-sm font-semibold text-[#003B43]">
+                {seleccionadas.size} {seleccionadas.size === 1 ? 'fila seleccionada' : 'filas seleccionadas'}
+              </span>
+
+              <select
+                value={clasificacionSeleccion}
+                onChange={(e) => setClasificacionSeleccion(e.target.value)}
+                disabled={aplicandoSeleccion}
+                className="text-sm border border-[#d1d5db] rounded-lg px-3 py-2 bg-white text-[#191c1e] focus:outline-none focus:ring-2 focus:ring-[#003B43] focus:border-transparent cursor-pointer disabled:opacity-50 min-w-[220px]"
+              >
+                <option value="">— Seleccionar clasificación —</option>
+                {OPCIONES.map((o) => (
+                  <option key={o.label} value={o.label}>{o.label}</option>
+                ))}
+              </select>
+
+              <button
+                onClick={handleAplicarSeleccion}
+                disabled={!clasificacionSeleccion || aplicandoSeleccion}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-[#ffffff] transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ background: '#003B43' }}
+              >
+                {aplicandoSeleccion ? 'Aplicando…' : 'Aplicar a la selección'}
+              </button>
+
+              <button
+                onClick={() => setSeleccionadas(new Set())}
+                disabled={aplicandoSeleccion}
+                className="text-sm font-medium text-[#6b7280] hover:text-[#191c1e] disabled:opacity-40"
+              >
+                Deseleccionar todo
+              </button>
+            </div>
+          )}
+
+          {/* ── progreso ─────────────────────────────────────────────────── */}
+          <div className="mb-4 flex items-center justify-between">
+            <span className="text-sm text-[#6b7280]">
+              <span className="font-semibold text-[#191c1e]">{completasCount}</span>
+              {' '}de{' '}
+              <span className="font-semibold text-[#191c1e]">{filasRecibido.length}</span>
+              {' '}compras clasificadas{empresaId ? ' (retención + IVA + concepto)' : ''}
+            </span>
+            <div className="w-48 h-1.5 rounded-full bg-[#e5e7eb] overflow-hidden">
+              <div
+                className="h-full rounded-full bg-[#16a34a] transition-all duration-300"
+                style={{ width: `${filasRecibido.length ? (completasCount / filasRecibido.length) * 100 : 0}%` }}
+              />
+            </div>
+          </div>
+
+          {/* ── tabla ────────────────────────────────────────────────────── */}
+          <div className="bg-white rounded-2xl border border-[#e2e4ef] shadow-sm overflow-hidden">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="bg-[#f8f9fc] border-b border-[#e2e4ef]">
+                  <th className="px-4 py-3 w-10">
+                    <input
+                      type="checkbox"
+                      checked={todasVisiblesSeleccionadas}
+                      onChange={toggleSeleccionarTodasVisibles}
+                      className="w-4 h-4 rounded border-[#d1d5db] text-[#003B43] focus:ring-[#003B43] cursor-pointer"
+                    />
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-[#8890b5] uppercase tracking-wide">
+                    <div className="flex items-center gap-1">
+                      <span>Fecha</span>
+                      <button
+                        onClick={() => toggleOrden('fecha')}
+                        className={claseIconoFiltro(ordenColumna === 'fecha')}
+                        title="Ordenar por fecha"
+                      >
+                        {iconoOrden('fecha')}
+                      </button>
+                      <button
+                        ref={btnFechaRef}
+                        onClick={() => abrirFiltro('fecha', btnFechaRef)}
+                        className={claseIconoFiltro(filtroFecha !== null)}
+                        title="Filtrar por fecha"
+                      >
+                        filter_alt
+                      </button>
+                    </div>
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-[#8890b5] uppercase tracking-wide">
+                    <div className="flex items-center gap-1">
+                      <span>Emisor</span>
+                      <button
+                        ref={btnEmisorRef}
+                        onClick={() => abrirFiltro('emisor', btnEmisorRef)}
+                        className={claseIconoFiltro(filtroEmisor !== null)}
+                        title="Filtrar por emisor"
+                      >
+                        filter_alt
+                      </button>
+                    </div>
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-[#8890b5] uppercase tracking-wide">
+                    <div className="flex items-center justify-end gap-1">
+                      <button
+                        onClick={() => toggleOrden('total')}
+                        className={claseIconoFiltro(ordenColumna === 'total')}
+                        title="Ordenar por base"
+                      >
+                        {iconoOrden('total')}
+                      </button>
+                      <button
+                        ref={btnTotalRef}
+                        onClick={() => abrirFiltro('total', btnTotalRef)}
+                        className={claseIconoFiltro(filtroTotal !== null)}
+                        title="Filtrar por base"
+                      >
+                        filter_alt
+                      </button>
+                      <span title="Total − IVA — base sobre la que se calcula la retención">Base</span>
+                    </div>
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-[#8890b5] uppercase tracking-wide">Retención</th>
+                  {empresaId && (
+                    <>
+                      <th className="px-4 py-3 text-left text-xs font-semibold text-[#8890b5] uppercase tracking-wide">IVA</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold text-[#8890b5] uppercase tracking-wide">Concepto</th>
+                    </>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {filasOrdenadas.length === 0 ? (
+                  <tr>
+                    <td colSpan={empresaId ? 7 : 5} className="px-4 py-8 text-center text-sm text-[#8890b5]">
+                      Ningún resultado coincide con los filtros.
+                    </td>
+                  </tr>
+                ) : filasOrdenadas.map((fila, i) => (
+                  <FilaClasificacion
+                    key={fila.indice}
+                    fila={fila}
+                    borradorId={borradorId}
+                    valorActual={clasificaciones[fila.indice]}
+                    onClasificado={handleClasificado}
+                    isEven={i % 2 === 1}
+                    seleccionada={seleccionadas.has(fila.indice)}
+                    onToggleSeleccion={toggleSeleccion}
+                    empresaId={empresaId}
+                    valorIvaActual={clasificacionesIva[fila.indice]}
+                    onClasificadoIva={handleClasificadoIva}
+                    valorConceptoActual={conceptos[fila.indice]}
+                    onClasificadoConcepto={handleClasificadoConcepto}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* ── menús de filtro (portal, posicionados sobre el ícono que los abrió) ── */}
+          {filtroPopover?.columna === 'fecha' && (
+            <ColumnFilterMenu
+              rect={filtroPopover.rect}
+              valores={valoresFecha}
+              seleccion={filtroFecha}
+              onAplicar={(s) => { setFiltroFecha(s); cerrarFiltro() }}
+              onCerrar={cerrarFiltro}
+            />
+          )}
+          {filtroPopover?.columna === 'emisor' && (
+            <ColumnFilterMenu
+              rect={filtroPopover.rect}
+              valores={valoresEmisor}
+              seleccion={filtroEmisor}
+              onAplicar={(s) => { setFiltroEmisor(s); cerrarFiltro() }}
+              onCerrar={cerrarFiltro}
+            />
+          )}
+          {filtroPopover?.columna === 'total' && (
+            <TotalFilterMenu
+              rect={filtroPopover.rect}
+              valores={valoresTotal}
+              seleccion={filtroTotal}
+              onAplicar={(s) => { setFiltroTotal(s); cerrarFiltro() }}
+              onCerrar={cerrarFiltro}
+              align="right"
+            />
+          )}
+
+          {/* ── pie ──────────────────────────────────────────────────────── */}
+          <div ref={pieRef} className="mt-6 flex justify-end">
+            <button
+              disabled={!todasClasificadas}
+              onClick={() => navigate(`/dian/nomina/${borradorId}`)}
+              className="flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-semibold text-[#ffffff] transition active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{ background: '#003B43' }}
+              title={!todasClasificadas
+                ? `Clasifica todas las compras${empresaId ? ' (retención, IVA y concepto)' : ''} antes de continuar`
+                : ''}
+            >
+              Continuar a nómina
+              <span className="material-symbols-outlined text-base">arrow_forward</span>
+            </button>
+          </div>
+
+          {/* ── botón flotante: ir hacia abajo ───────────────────────────── */}
+          <button
+            onClick={irAlFinal}
+            aria-label="Ir al final"
+            title="Ir al final"
+            className={`fixed bottom-6 right-6 z-20 w-12 h-12 rounded-full shadow-lg flex items-center justify-center text-[#ffffff] transition-opacity duration-200 active:scale-[0.95] ${
+              mostrarBajar ? 'opacity-100' : 'opacity-0 pointer-events-none'
+            }`}
+            style={{ background: '#003B43' }}
+          >
+            <span className="material-symbols-outlined">arrow_downward</span>
+          </button>
+        </>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,48 @@
+﻿# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+node_modules
+dist
+dist-ssr
+*.local
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# Claude Code
+.claude/
+.claude.json
+CLAUDE.md
+# Docker
+.env
+backups/
+# MCP config (contains API keys)
+.mcp.json
+# n8n workflows (pueden contener credenciales en texto plano, ej. servicePassword)
+n8n/workflows/*.json
+*.dump
+*.tar.gz
+env_backup*.txt
+docs/SISTEMA CONTABILIDAD EXCEL.xlsx
+
+# Datos y artefactos generados
+*.db
+*.sqlite
+coverage/
+mcpServer/data/
+cypress/screenshots/
+cypress/videos/
+
+# Documentos con datos contables
+docs/*.xlsx

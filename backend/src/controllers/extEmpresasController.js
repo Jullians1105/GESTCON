@@ -1,0 +1,119 @@
+const db = require('../config/database');
+const auditLog = require('../utils/auditLog');
+
+const normalizeEmpresa = (row) => ({
+  id:                row.id,
+  name:              row.name,
+  responsableId:     row.responsable_id ?? null,
+  responsableNombre: row.responsable_nombre ?? null,
+  contador:          row.contador ?? null,
+  activa:            row.activa,
+  vigenteHastaAnio:  row.vigente_hasta_anio ?? null,
+  vigenteHastaMes:   row.vigente_hasta_mes  ?? null,
+  vigenteDesdeAnio:  row.vigente_desde_anio ?? null,
+  vigenteDesdeMes:   row.vigente_desde_mes  ?? null,
+  createdAt:         row.created_at,
+  updatedAt:         row.updated_at,
+});
+
+const getEmpresas = async (req, res, next) => {
+  try {
+    const result = await db.query(
+      `SELECT e.*, u.name AS responsable_nombre
+       FROM ext_empresas e
+       LEFT JOIN users u ON u.id = e.responsable_id
+       ORDER BY e.name ASC`
+    );
+    res.json(result.rows.map(normalizeEmpresa));
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getEmpresa = async (req, res, next) => {
+  try {
+    const result = await db.query(
+      `SELECT e.*, u.name AS responsable_nombre
+       FROM ext_empresas e
+       LEFT JOIN users u ON u.id = e.responsable_id
+       WHERE e.id = $1`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Empresa no encontrada' });
+    res.json(normalizeEmpresa(result.rows[0]));
+  } catch (err) {
+    next(err);
+  }
+};
+
+const updateEmpresa = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const existing = await db.query('SELECT id FROM ext_empresas WHERE id = $1', [id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Empresa no encontrada' });
+
+    const { name, activa } = req.body;
+    // responsableId/contador necesitan distinguir "no lo mandaron" (no tocar)
+    // de "lo mandaron en null" (desasignar) — COALESCE no sirve para eso,
+    // mismo problema que codigo_siigo en fondoEmpresasController.js.
+    const responsableIdProvided = Object.prototype.hasOwnProperty.call(req.body, 'responsableId');
+    const contadorProvided = Object.prototype.hasOwnProperty.call(req.body, 'contador');
+    // vigenteHasta* viaja como par (o los dos o ninguno, ver constraint de la
+    // migración 060) — mismo criterio de flag-de-presencia que responsableId/contador.
+    const vigenciaProvided = Object.prototype.hasOwnProperty.call(req.body, 'vigenteHastaAnio')
+      || Object.prototype.hasOwnProperty.call(req.body, 'vigenteHastaMes');
+    // vigenteDesde* igual (migración 068): par, un solo flag de presencia.
+    const vigenciaDesdeProvided = Object.prototype.hasOwnProperty.call(req.body, 'vigenteDesdeAnio')
+      || Object.prototype.hasOwnProperty.call(req.body, 'vigenteDesdeMes');
+    const result = await db.query(
+      `UPDATE ext_empresas SET
+        name           = COALESCE($1, name),
+        activa         = COALESCE($2, activa),
+        responsable_id = CASE WHEN $3 THEN $4 ELSE responsable_id END,
+        contador       = CASE WHEN $5 THEN $6 ELSE contador END,
+        vigente_hasta_anio = CASE WHEN $8 THEN $9 ELSE vigente_hasta_anio END,
+        vigente_hasta_mes  = CASE WHEN $8 THEN $10 ELSE vigente_hasta_mes END,
+        vigente_desde_anio = CASE WHEN $11 THEN $12 ELSE vigente_desde_anio END,
+        vigente_desde_mes  = CASE WHEN $11 THEN $13 ELSE vigente_desde_mes END
+       WHERE id = $7
+       RETURNING *`,
+      [
+        name !== undefined ? name.trim().toUpperCase() : null,
+        activa ?? null,
+        responsableIdProvided,
+        req.body.responsableId ?? null,
+        contadorProvided,
+        req.body.contador ? req.body.contador.trim() : null,
+        id,
+        vigenciaProvided,
+        req.body.vigenteHastaAnio ?? null,
+        req.body.vigenteHastaMes ?? null,
+        vigenciaDesdeProvided,
+        req.body.vigenteDesdeAnio ?? null,
+        req.body.vigenteDesdeMes ?? null,
+      ]
+    );
+    await auditLog(req.user.userId, 'UPDATE', 'ext_empresas', id, { name, activa, responsableId: req.body.responsableId, contador: req.body.contador, vigenteHastaAnio: req.body.vigenteHastaAnio, vigenteHastaMes: req.body.vigenteHastaMes, vigenteDesdeAnio: req.body.vigenteDesdeAnio, vigenteDesdeMes: req.body.vigenteDesdeMes });
+    req.io.emit('externas:updated', { empresaId: id, tipo: 'empresa' });
+    res.json(normalizeEmpresa(result.rows[0]));
+  } catch (err) {
+    next(err);
+  }
+};
+
+const deleteEmpresa = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const existing = await db.query('SELECT id FROM ext_empresas WHERE id = $1', [id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Empresa no encontrada' });
+
+    await db.query('DELETE FROM ext_empresas WHERE id = $1', [id]);
+    await auditLog(req.user.userId, 'DELETE', 'ext_empresas', id, {});
+    req.io.emit('externas:updated', { empresaId: id, tipo: 'empresa' });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getEmpresas, getEmpresa, updateEmpresa, deleteEmpresa };

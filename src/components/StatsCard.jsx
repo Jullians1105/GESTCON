@@ -1,0 +1,80 @@
+import { useRef, useEffect } from 'react'
+import { useCountUp } from 'react-countup'
+
+export default function StatsCard({
+  title, value, icon, borderColor = '#004ac6', iconColor = '#004ac6', sub, subColor = '#434655',
+  // Selector de mes — opcional. Si no se pasa monthLabel, la tarjeta se ve y
+  // comporta exactamente igual que antes (usada también por Dashboard y
+  // FondoEmprenderEmpresasPage, que no necesitan esto).
+  monthLabel, onPrevMonth, onNextMonth, prevMonthDisabled, nextMonthDisabled,
+  // Decimales — opcional, para valores monetarios (ej. Exógenas). Sin esto, el resto de
+  // páginas (conteos enteros) se comporta exactamente igual que antes.
+  decimals = 0, decimalSeparator, thousandSeparator,
+}) {
+  const countUpRef = useRef(null)
+  const { update } = useCountUp({
+    ref: countUpRef,
+    start: 0,
+    end: value,
+    duration: 0.7,
+    useEasing: true,
+    decimals,
+    decimal: decimalSeparator,
+    separator: thousandSeparator,
+  })
+
+  // Re-animate whenever value changes (skip first render — initial anim handles it)
+  const isFirst = useRef(true)
+  useEffect(() => {
+    if (isFirst.current) { isFirst.current = false; return }
+    update(value)
+  }, [value, update])
+
+  // Números grandes (montos en pesos sin decimales de por medio) no tienen espacios donde
+  // hacer salto de línea — en vez de partirse a la mitad o desbordar la tarjeta, la letra se
+  // achica según la cantidad de dígitos enteros, y así siempre cabe en una sola línea.
+  const digitos = Math.abs(Math.trunc(value ?? 0)).toString().length
+  const tamañoValor =
+    digitos <= 6 ? 'text-[32px]' : digitos <= 9 ? 'text-[24px]' : digitos <= 12 ? 'text-[19px]' : 'text-[15px]'
+
+  return (
+    <div
+      className="h-full min-w-0 bg-white p-6 rounded-xl shadow-sm border-l-4 flex flex-col justify-between hover:shadow-md transition-shadow"
+      style={{ borderLeftColor: borderColor }}
+    >
+      <div className="flex justify-between items-start">
+        <span className="text-[12px] font-semibold text-[#434655]">{title}</span>
+        <span className="material-symbols-outlined" style={{ color: iconColor, fontSize: 22 }}>{icon}</span>
+      </div>
+      {monthLabel && (
+        <div className="flex items-center gap-0.5 mt-1">
+          <button
+            onClick={onPrevMonth}
+            disabled={prevMonthDisabled}
+            title="Mes anterior"
+            className="p-0.5 rounded hover:bg-[#f3f4f6] transition text-[#8890b5] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>chevron_left</span>
+          </button>
+          <span className="text-[11px] font-medium text-[#8890b5] min-w-[64px] text-center">{monthLabel}</span>
+          <button
+            onClick={onNextMonth}
+            disabled={nextMonthDisabled}
+            title="Mes siguiente"
+            className="p-0.5 rounded hover:bg-[#f3f4f6] transition text-[#8890b5] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>chevron_right</span>
+          </button>
+        </div>
+      )}
+      <div className="mt-4">
+        <h3 className={`${tamañoValor} font-bold text-[#191c1e] leading-none whitespace-nowrap`}>
+          <span ref={countUpRef} />
+        </h3>
+        {sub && (
+          <p className="text-[12px] mt-1 flex items-center gap-1" style={{ color: subColor }}>{sub}</p>
+        )}
+      </div>
+    </div>
+  )
+}

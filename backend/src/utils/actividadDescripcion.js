@@ -1,0 +1,317 @@
+// Convierte un registro crudo de audit_log en una frase legible para la pantalla "Actividad".
+// El registro guarda identificadores (empresaId, procesoId…) y el servidor los traduce a nombres
+// con el mapa `nombres` antes de llamar acá. Nunca se muestra el contenido de claves DIAN: de esas
+// tablas solo se usa el tipo de acción y datos no sensibles (cantidad, éxito).
+
+const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+const MP_NAMES = {
+  mp1: 'Facturación', mp2: 'Nómina', mp3: 'Nómina electrónica',
+  mp4: 'Documentos contador - Pagos', mp6: 'Información tributaria', mp7: 'Producción y ventas',
+};
+const ESTADO_ITEM = { done: 'Realizado', na: 'No aplica', in_progress: 'En proceso', pending: 'Pendiente' };
+const ESTADO_PAGO = { enviado: 'Enviado', pendiente: 'Pendiente', pagado: 'Pagado' };
+const ESTADO_TAREA = { pending: 'pendiente', in_progress: 'en progreso', completed: 'completada' };
+const ACCION = { CREATE: 'Creó', UPDATE: 'Actualizó', DELETE: 'Eliminó', READ: 'Consultó' };
+
+// Acuses: nombres de las listas y de los estados, y fechas «hasta qué día quedó».
+const LISTA_ACUSES = { contable: 'Contable', tributario: 'Tributario', externas: 'Externas' };
+const ESTADO_ACUSE = { pendiente: 'Sin hacer', al_dia: 'Al día', con_pendientes: 'Con pendientes', no_se_puede: 'No se puede', no_hacer: 'No hacer' };
+const ESTADO_ACUSE_CLAVE = { al_dia: 'hecho', con_pendientes: 'proceso', no_hacer: 'noaplica', no_se_puede: 'noaplica', pendiente: 'pendiente' };
+const fechaAcuse = (iso) => (iso ? `${Number(iso.slice(8, 10))} ${MESES[Number(iso.slice(5, 7)) - 1].slice(0, 3)} ${iso.slice(0, 4)}` : 'sin fecha');
+const diasEntre = (desde, hasta) => Math.round((Date.UTC(+hasta.slice(0, 4), +hasta.slice(5, 7) - 1, +hasta.slice(8, 10)) - Date.UTC(+desde.slice(0, 4), +desde.slice(5, 7) - 1, +desde.slice(8, 10))) / 86400000);
+
+const mesAnio = (c) => (c.mes && c.anio ? ` (${MESES[c.mes - 1]} ${c.anio})` : '');
+const desdeMes = (anio, mes) => `${MESES[mes - 1]} ${anio}`;
+const nota = (c) => (c.nota ? ` — nota: ${c.nota}` : '');
+// "2026-10-15" -> "15 de octubre de 2026"
+const fechaLarga = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  return m ? `${Number(m[3])} de ${MESES[Number(m[2]) - 1]} de ${m[1]}` : iso;
+};
+const dinero = (v) => `$${Number(v).toLocaleString('es-CO')}`;
+// "2026-09" -> "septiembre 2026"; "2026-C2" -> "cuatrimestre 2 de 2026"; "2026" -> "2026"
+const periodoTxt = (p) => {
+  const mes = /^(\d{4})-(\d{2})$/.exec(p);
+  if (mes) return `${MESES[Number(mes[2]) - 1]} ${mes[1]}`;
+  const cuatri = /^(\d{4})-C(\d)$/.exec(p);
+  if (cuatri) return `cuatrimestre ${cuatri[2]} de ${cuatri[1]}`;
+  return p;
+};
+
+const EMPRESAS_MODULO = {
+  fondo_empresas: ['fondoEmp', 'Fondo Emprender'],
+  ext_empresas: ['extEmp', 'Empresas Externas'],
+  ne_empresas: ['neEmp', 'Nómina Electrónica'],
+};
+
+// nombres: { fondoEmp, extEmp, neEmp, fondoProc, extProc, impuestos, tasks } — cada uno { [id]: nombre }
+function describirEvento(row, nombres = {}) {
+  const c = row.changes || {};
+  const a = row.action;
+  const n = (mapa, id) => (nombres[mapa] && nombres[mapa][id]) || null;
+  const emp = (mapa, id) => n(mapa, id) || 'una empresa';
+
+  switch (row.table_name) {
+    case 'dian_clave':
+      if (a === 'READ') return { area: 'Claves DIAN', texto: 'Abrió una pantalla con claves DIAN' };
+      if (a === 'DELETE') return { area: 'Claves DIAN', texto: 'Quitó la clave DIAN de una empresa' };
+      return { area: 'Claves DIAN', texto: 'Cambió la clave DIAN de una empresa' };
+    case 'dian_token':
+      return { area: 'Claves DIAN', texto: c.success === false ? 'Intentó generar un token DIAN (falló)' : 'Generó un token DIAN' };
+    case 'dian_deudas_revision': {
+      // Varias acciones sobre una revisión comparten tabla: se distinguen por lo que guarda `changes`.
+      if (a === 'CREATE') return { area: 'Deudas DIAN', texto: 'Revisó las deudas DIAN de una empresa' };
+      if (c.correoEnviado === true) return { area: 'Deudas DIAN', texto: 'Marcó «Ya se envió» el correo de deudas DIAN de una empresa' };
+      if (c.correoEnviado === false) return { area: 'Deudas DIAN', texto: 'Quitó la marca «Ya se envió» del correo de deudas DIAN de una empresa' };
+      if (c.marcadaRevisada === true) return { area: 'Deudas DIAN', texto: 'Marcó como revisada a una empresa en Deudas DIAN' };
+      if (c.marcadaRevisada === false) return { area: 'Deudas DIAN', texto: 'Quitó la marca de revisada a una empresa en Deudas DIAN' };
+      if (c.marcadas !== undefined) {
+        return { area: 'Deudas DIAN', texto: `Marcó como revisadas a ${c.marcadas} empresa${c.marcadas === 1 ? '' : 's'} al día en Deudas DIAN` };
+      }
+      return { area: 'Deudas DIAN', texto: 'Cambió la revisión de una empresa en Deudas DIAN' };
+    }
+    case 'acuses': {
+      const lista = LISTA_ACUSES[c.area] || '';
+      const de = lista ? ` de ${lista}` : '';
+      const nombre = c.nombre ?? n('acuses', row.record_id);
+      const quien = nombre ? `${nombre}${lista ? ` (${lista})` : ''}` : `una empresa${de}`;
+      if (a === 'CREATE') return { area: 'Acuses', texto: nombre ? `Agregó ${quien} a los acuses` : `Agregó una empresa a los acuses${de}` };
+      if (a === 'DELETE') return { area: 'Acuses', texto: nombre ? `Quitó ${quien} de los acuses` : `Quitó una empresa de los acuses${de}` };
+      // Un mismo guardado puede traer varios campos: se cuentan todos, con el antes → después cuando se conoce.
+      const partes = [];
+      if ('estado' in c) {
+        const antes = c.antes && c.antes.estado ? ESTADO_ACUSE[c.antes.estado] ?? c.antes.estado : null;
+        const despues = ESTADO_ACUSE[c.estado] ?? c.estado;
+        partes.push(antes ? `estado «${antes}» → «${despues}»` : `estado «${despues}»`);
+      }
+      if ('hasta' in c) {
+        const antes = c.antes && 'hasta' in c.antes ? c.antes.hasta : undefined;
+        if (!c.hasta) partes.push('quitó la fecha');
+        else {
+          const dias = antes && diasEntre(antes, c.hasta);
+          partes.push(antes === undefined ? `hasta ${fechaAcuse(c.hasta)}` : `hasta ${fechaAcuse(antes)} → ${fechaAcuse(c.hasta)}${dias ? ` (${dias > 0 ? '+' : ''}${dias} ${Math.abs(dias) === 1 ? 'día' : 'días'})` : ''}`);
+        }
+      }
+      if ('nota' in c) partes.push(c.nota ? 'escribió o cambió la nota' : 'borró la nota');
+      if ('empresaId' in c) partes.push(c.empresaId ? 'la enlazó con el Directorio' : 'quitó el enlace con el Directorio');
+      if (!partes.length) return { area: 'Acuses', texto: `Editó ${quien}` };
+      if (!nombre) {
+        // Registros sin empresa (anteriores): se conserva la frase general.
+        if ('estado' in c) return { area: 'Acuses', texto: `Cambió el estado de los acuses de una empresa${de}` };
+        if ('hasta' in c) return { area: 'Acuses', texto: `Actualizó hasta qué día quedaron los acuses de una empresa${de}` };
+        if ('nota' in c) return { area: 'Acuses', texto: `Escribió o cambió la nota de los acuses de una empresa${de}` };
+        if ('empresaId' in c) return { area: 'Acuses', texto: `Enlazó con el Directorio una empresa de los acuses${de}` };
+        return { area: 'Acuses', texto: `Editó una empresa de los acuses${de}` };
+      }
+      return { area: 'Acuses', texto: `${quien}: ${partes.join(' · ')}` };
+    }
+    case 'dian_deudas_comentario':
+      return { area: 'Deudas DIAN', texto: c.eliminado ? 'Eliminó el comentario de una empresa en Deudas DIAN' : 'Escribió o editó el comentario de una empresa en Deudas DIAN' };
+    case 'dian_deudas_lote':
+      return { area: 'Deudas DIAN', texto: 'Revisó las deudas DIAN de todas las empresas' };
+    case 'dian_deudas_detalle':
+      return { area: 'Deudas DIAN', texto: 'Cambió el estado de una deuda DIAN' };
+
+    case 'empresas':
+      if (a === 'CREATE') return { area: 'Directorio', texto: `Creó la empresa ${c.name ?? ''}`.trim() };
+      if (a === 'DELETE') return { area: 'Directorio', texto: 'Eliminó una empresa del directorio' };
+      if (c.fusionadaCon) return { area: 'Directorio', texto: 'Fusionó dos empresas del directorio' };
+      return {
+        area: 'Directorio',
+        texto: `Editó la empresa ${c.name ?? ''}${c.nitAnterior !== undefined && c.nit !== c.nitAnterior ? ' (cambió el documento)' : ''}`.trim(),
+      };
+
+    case 'fondo_empresas':
+    case 'ext_empresas':
+    case 'ne_empresas': {
+      const [mapa, area] = EMPRESAS_MODULO[row.table_name];
+      const nombre = n(mapa, row.record_id);
+      if (a === 'CREATE') return { area, texto: `Habilitó ${nombre ?? 'una empresa'} en ${area}` };
+      if (a === 'DELETE') return { area, texto: `Quitó una empresa de ${area}` };
+      if (c.vigenteDesdeAnio) return { area, texto: `Empezó ${nombre ?? 'una empresa'} en ${area} desde ${desdeMes(c.vigenteDesdeAnio, c.vigenteDesdeMes)}` };
+      if (c.vigenteHastaAnio) return { area, texto: `Terminó ${nombre ?? 'una empresa'} en ${area} en ${desdeMes(c.vigenteHastaAnio, c.vigenteHastaMes)}` };
+      return { area, texto: `Editó ${nombre ?? 'una empresa'} en ${area}` };
+    }
+
+    case 'fondo_checklist_items':
+      return { area: 'Fondo Emprender', texto: `Marcó «${n('fondoProc', c.procesoId) ?? 'un proceso'}» de ${emp('fondoEmp', c.empresaId)} como ${ESTADO_ITEM[c.estado] ?? c.estado}${mesAnio(c)}${nota(c)}` };
+    case 'ext_checklist_items':
+      return { area: 'Empresas Externas', texto: `Marcó «${n('extProc', c.procesoId) ?? 'un proceso'}» de ${emp('extEmp', c.empresaId)} como ${ESTADO_ITEM[c.estado] ?? c.estado}${mesAnio(c)}${nota(c)}` };
+    case 'ext_checklist_meses':
+      return {
+        area: 'Empresas Externas',
+        texto: `Registró ${c.resultadoTipo === 'perdida' ? 'una pérdida' : 'una utilidad'}${c.resultadoValor != null ? ` de ${dinero(c.resultadoValor)}` : ''} en ${emp('extEmp', c.empresaId)}${mesAnio(c)}`,
+      };
+    case 'fondo_checklist_meses': {
+      const que = c.tipo === 'nomina' ? 'nómina' : (c.tipo ?? '');
+      const empresa = emp('fondoEmp', c.empresaId);
+      if (c.enviado !== undefined) {
+        return { area: 'Fondo Emprender', texto: `${c.enviado ? 'Marcó como enviada' : 'Quitó la marca de enviada de'} la ${que} de ${empresa}${mesAnio(c)}` };
+      }
+      return { area: 'Fondo Emprender', texto: `${c.confirmed ? 'Confirmó' : 'Quitó la confirmación de'} la ${que} de ${empresa}${mesAnio(c)}` };
+    }
+    case 'fondo_detalle_macroprocesos':
+      return { area: 'Fondo Emprender', texto: `Marcó «${MP_NAMES[c.macroId] ?? c.macroId}» de ${emp('fondoEmp', c.empresaId)} como ${ESTADO_ITEM[c.estado] ?? c.estado}` };
+    case 'fondo_impuestos_items':
+      return { area: 'Fondo Emprender', texto: `Marcó «${n('impuestos', c.impuestoId) ?? 'un impuesto'}» de ${emp('fondoEmp', c.empresaId)} como ${ESTADO_ITEM[c.estado] ?? c.estado}${mesAnio(c)}` };
+
+    case 'fondo_pagos':
+      if (c.monto !== undefined) return { area: 'Pagos', texto: `Creó el pago de ${emp('fondoEmp', c.empresaId)} por ${dinero(c.monto)}${mesAnio(c)}` };
+      if (c.autorizado !== undefined) return { area: 'Pagos', texto: `${c.autorizado ? 'Autorizó' : 'Quitó la autorización de'} el pago de ${emp('fondoEmp', c.empresaId)}${mesAnio(c)}` };
+      return { area: 'Pagos', texto: `Marcó el pago de ${emp('fondoEmp', c.empresaId)} como ${ESTADO_PAGO[c.estado] ?? c.estado}${nota(c)}` };
+    case 'fondo_pagos_mes_actual':
+      return { area: 'Pagos', texto: c.accion === 'retroceder' ? `Retrocedió el mes de pagos a ${desdeMes(c.nuevoAnio, c.nuevoMes)}` : `Habilitó ${desdeMes(c.nuevoAnio, c.nuevoMes)} para pagos` };
+
+    case 'ne_meses': {
+      const empresa = emp('neEmp', c.empresaId);
+      let accion = `Dejó sin marcar la nómina electrónica de ${empresa}`;
+      if (c.estado === 'presentada') accion = `Marcó la nómina electrónica de ${empresa} como Presentada`;
+      else if (c.estado === 'no_aplica') accion = `Dejó en espera la nómina electrónica de ${empresa}`;
+      else if (c.autorizada) accion = `Autorizó la nómina electrónica de ${empresa}`;
+      return { area: 'Nómina Electrónica', texto: `${accion}${mesAnio(c)}${nota(c)}${c.novedadNota ? ` — novedad: ${c.novedadNota}` : ''}` };
+    }
+    case 'ne_plazo_mes':
+    case 'ne_plazo':
+      return { area: 'Nómina Electrónica', texto: `Fijó la fecha límite de nómina electrónica${c.fechaLimite ? `: ${fechaLarga(c.fechaLimite)}` : ''}` };
+
+    case 'fondo_procesos':
+    case 'ext_procesos':
+    case 'fondo_proceso_grupos':
+    case 'ext_proceso_grupos': {
+      const esFondo = row.table_name.startsWith('fondo');
+      const area = esFondo ? 'Fondo Emprender' : 'Empresas Externas';
+      const que = row.table_name.endsWith('grupos') ? 'el grupo' : 'el proceso';
+      const nombre = c.name ?? n(esFondo ? 'fondoProc' : 'extProc', row.record_id);
+      if (a === 'CREATE') return { area, texto: `Creó ${que} «${nombre ?? ''}»` };
+      if (a === 'DELETE') return { area, texto: `Eliminó ${que}${nombre ? ` «${nombre}»` : ''}` };
+      return { area, texto: `Editó ${que}${nombre ? ` «${nombre}»` : ''}` };
+    }
+
+    case 'contab_reporte':
+      return { area: 'Contabilidad', texto: `Subió el reporte DIAN de ${c.empresaId ? emp('contabEmp', c.empresaId) : 'una empresa sin asignar'}` };
+    case 'contab_exportacion':
+      return { area: 'Contabilidad', texto: `Exportó el Excel de contabilidad de ${c.empresaId ? emp('contabEmp', c.empresaId) : 'una empresa sin asignar'}${c.periodo ? ` (${periodoTxt(c.periodo)})` : ''}` };
+    case 'exogenas_archivo':
+      return {
+        area: 'Exógenas',
+        texto: `Analizó la exógena ${c.formato ?? ''}${c.contabEmpresaId ? ` de ${emp('contabEmp', c.contabEmpresaId)}` : ''}${c.anio ? ` (${c.anio})` : ''}`.replace(/\s+/g, ' ').trim(),
+      };
+    case 'exogenas_generado':
+      return { area: 'Exógenas', texto: `Generó el Excel de exógenas (${(c.formatos || []).join(', ') || 'sin formato'})` };
+    case 'terceros_importacion':
+      return { area: 'Terceros', texto: 'Importó terceros' };
+    case 'empresas_rues':
+      return { area: 'Directorio', texto: 'Actualizó la matrícula mercantil de las empresas (RUES)' };
+    case 'terceros_consulta':
+      return { area: 'Terceros', texto: `Consultó el tercero ${c.documento ?? row.record_id}` };
+    case 'terceros_rues':
+      return { area: 'Terceros', texto: 'Verificó los terceros en el RUES' };
+    case 'contab_consolidado_exportacion':
+      return { area: 'Consolidado', texto: `Exportó el consolidado de ${c.empresaId ? emp('contabEmp', c.empresaId) : 'una empresa'}${c.periodo ? ` (${periodoTxt(c.periodo)})` : ''}` };
+
+    case 'tasks': {
+      const titulo = c.title ?? n('tasks', row.record_id);
+      const t = titulo ? ` «${titulo}»` : '';
+      if (a === 'CREATE') return { area: 'Tareas', texto: `Creó la tarea${t}` };
+      if (a === 'DELETE') return { area: 'Tareas', texto: titulo ? `Eliminó la tarea${t}` : 'Eliminó una tarea' };
+      if (c.status && c.status.to) return { area: 'Tareas', texto: `Pasó la tarea${t} a ${ESTADO_TAREA[c.status.to] ?? c.status.to}` };
+      return { area: 'Tareas', texto: `Editó la tarea${t}` };
+    }
+
+    default:
+      return { area: 'Otros', texto: `${ACCION[a] ?? a} en ${row.table_name}` };
+  }
+}
+
+// ── Clasificación para el resumen ────────────────────────────────────────────────
+// Además de la frase, cada registro se clasifica para poder contar: qué se hizo (`item`, un proceso o
+// un tipo de acción), en qué estado quedó (`estadoClave`: hecho | proceso | noaplica | pendiente, o null
+// si la acción no es de estado) y sobre qué empresa. `clave` identifica la misma casilla (empresa +
+// proceso + mes) para quedarse con el último estado del día cuando alguien la cambia varias veces.
+const ESTADO_CLAVE = { done: 'hecho', in_progress: 'proceso', na: 'noaplica', pending: 'pendiente' };
+
+function clasificarEvento(row, nombres = {}) {
+  const c = row.changes || {};
+  const a = row.action;
+  const n = (mapa, id) => (nombres[mapa] && nombres[mapa][id]) || null;
+  const casilla = (empresaId, que) => `${empresaId ?? ''}|${que ?? ''}|${c.anio ?? ''}-${c.mes ?? ''}`;
+  const accion = (item) => ({ item, estadoClave: null, empresa: null, clave: null });
+
+  switch (row.table_name) {
+    case 'fondo_checklist_items':
+      return { item: n('fondoProc', c.procesoId) ?? 'Proceso sin nombre', estadoClave: ESTADO_CLAVE[c.estado] ?? null, empresa: n('fondoEmp', c.empresaId), clave: casilla(c.empresaId, c.procesoId) };
+    case 'ext_checklist_items':
+      return { item: n('extProc', c.procesoId) ?? 'Proceso sin nombre', estadoClave: ESTADO_CLAVE[c.estado] ?? null, empresa: n('extEmp', c.empresaId), clave: casilla(c.empresaId, c.procesoId) };
+    case 'fondo_impuestos_items':
+      return { item: n('impuestos', c.impuestoId) ?? 'Impuesto', estadoClave: ESTADO_CLAVE[c.estado] ?? null, empresa: n('fondoEmp', c.empresaId), clave: casilla(c.empresaId, `imp-${c.impuestoId}`) };
+    case 'fondo_detalle_macroprocesos':
+      return { item: `Macroproceso: ${MP_NAMES[c.macroId] ?? c.macroId}`, estadoClave: ESTADO_CLAVE[c.estado] ?? null, empresa: n('fondoEmp', c.empresaId), clave: `${c.empresaId}|macro-${c.macroId}` };
+    case 'ne_meses': {
+      let estadoClave = 'pendiente';
+      if (c.estado === 'presentada') estadoClave = 'hecho';
+      else if (c.estado === 'no_aplica') estadoClave = 'noaplica';
+      else if (c.autorizada) estadoClave = 'proceso';
+      return { item: 'Nómina electrónica', estadoClave, empresa: n('neEmp', c.empresaId), clave: casilla(c.empresaId, 'ne') };
+    }
+    case 'fondo_checklist_meses': {
+      const que = c.tipo === 'nomina' ? 'nómina' : (c.tipo ?? '');
+      if (c.enviado !== undefined) return { item: `Envío de ${que}`, estadoClave: c.enviado ? 'hecho' : 'pendiente', empresa: n('fondoEmp', c.empresaId), clave: casilla(c.empresaId, `envio-${c.tipo}`) };
+      return { item: `Confirmación de ${que}`, estadoClave: c.confirmed ? 'hecho' : 'pendiente', empresa: n('fondoEmp', c.empresaId), clave: casilla(c.empresaId, `conf-${c.tipo}`) };
+    }
+    case 'ext_checklist_meses':
+      return { item: 'Utilidad o pérdida del mes', estadoClave: 'hecho', empresa: n('extEmp', c.empresaId), clave: casilla(c.empresaId, 'resultado') };
+    case 'fondo_pagos': {
+      let estadoClave = 'pendiente';
+      if (c.estado === 'enviado' || c.estado === 'pagado') estadoClave = 'hecho';
+      else if (c.monto !== undefined || c.autorizado === true) estadoClave = 'proceso';
+      return { item: 'Pago a la fiduciaria', estadoClave, empresa: n('fondoEmp', c.empresaId), clave: casilla(c.empresaId, 'pago') };
+    }
+
+    case 'contab_reporte': return { ...accion('Subir reporte DIAN'), empresa: n('contabEmp', c.empresaId) };
+    case 'contab_exportacion': return { ...accion('Exportar Excel de contabilidad'), empresa: n('contabEmp', c.empresaId) };
+    case 'exogenas_archivo': return { ...accion('Analizar exógenas'), empresa: n('contabEmp', c.contabEmpresaId) };
+    case 'exogenas_generado': return accion('Generar Excel de exógenas');
+    case 'terceros_importacion': return accion('Importar terceros');
+    case 'terceros_rues': return accion('Verificar terceros en el RUES');
+    case 'empresas_rues': return accion('Actualizar matrícula (RUES) de las empresas');
+    case 'terceros_consulta': return accion('Consultar un tercero');
+    case 'contab_consolidado_exportacion': return { ...accion('Exportar consolidado'), empresa: n('contabEmp', c.empresaId) };
+    case 'dian_clave': return accion(a === 'READ' ? 'Abrir pantallas con claves DIAN a la vista' : 'Guardar o quitar clave DIAN');
+    case 'dian_token': return accion('Generar token DIAN');
+    case 'dian_deudas_revision':
+      if (a === 'CREATE') return accion('Revisar deudas DIAN');
+      if (c.correoEnviado !== undefined) return accion('Marcar correo de deudas DIAN como enviado');
+      return accion('Marcar como revisada en Deudas DIAN');
+    case 'dian_deudas_comentario': return accion('Comentar en Deudas DIAN');
+    case 'acuses': {
+      const lista = LISTA_ACUSES[c.area];
+      const nombre = c.nombre ?? n('acuses', row.record_id);
+      const base = { item: `Acuses${lista ? ` · ${lista}` : ''}`, empresa: nombre, clave: `${row.record_id}|acuses`, estadoClave: 'estado' in c ? ESTADO_ACUSE_CLAVE[c.estado] ?? null : null };
+      // Días que avanzó la fecha «hasta» (solo si se conoce la de antes; negativo si la retrocedió).
+      if (typeof c.nota === 'string' && c.nota.trim()) base.notaTexto = c.nota.trim();
+      if (c.hasta) { base.hasta = c.hasta; if (c.antes && c.antes.hasta) base.antesHasta = c.antes.hasta; }
+      if (c.antes && c.antes.hasta && c.hasta) return { ...base, avanceDias: diasEntre(c.antes.hasta, c.hasta) };
+      return base;
+    }
+    case 'dian_deudas_lote':
+    case 'dian_deudas_detalle': return accion('Revisar deudas DIAN');
+    case 'empresas': return accion(a === 'CREATE' ? 'Crear empresa en el directorio' : 'Editar empresa del directorio');
+    case 'fondo_empresas':
+    case 'ext_empresas':
+    case 'ne_empresas': return accion('Habilitar o editar empresa en un módulo');
+    case 'fondo_procesos':
+    case 'ext_procesos':
+    case 'fondo_proceso_grupos':
+    case 'ext_proceso_grupos': return accion('Editar procesos y grupos');
+    case 'fondo_pagos_mes_actual': return accion('Habilitar el mes de pagos');
+    case 'ne_plazo_mes':
+    case 'ne_plazo': return accion('Fijar la fecha límite de nómina electrónica');
+    case 'tasks':
+      if (a === 'CREATE') return accion('Crear tarea');
+      if (a === 'DELETE') return accion('Eliminar tarea');
+      return accion(c.status && c.status.to ? 'Cambiar el estado de una tarea' : 'Editar tarea');
+    default: return accion(`Otras acciones (${row.table_name})`);
+  }
+}
+
+module.exports = { describirEvento, clasificarEvento };
