@@ -259,4 +259,4 @@ Lo que esta planeado pero NO esta implementado:
 
 ---
 
-*Proyecto personal desarrollado con Claude Code (Anthropic). El design system fue definido visualmente en Stitch y luego implementado en React + Tailwind.*
+*Proyecto personal. El design system fue definido visualmente en Stitch y luego implementado en React + Tailwind.*

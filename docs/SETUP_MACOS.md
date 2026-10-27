@@ -1,6 +1,6 @@
 # Setup en macOS — GestionTareasOficina
 
-Prompt para ejecutar en Claude Code al abrir el proyecto en un Mac por primera vez.
+Guía para poner en marcha el proyecto en un Mac por primera vez.
 
 ---
 
@@ -116,7 +116,7 @@ Avísame cuando los procesos estén corriendo y sin errores en consola.
 
 ```
 El MCP server de gestor-tareas es opcional desde la Fase 3.
-Si lo necesitas activo en Claude Code:
+Si lo necesitas activo en tu cliente MCP:
 
 1. Instala sus dependencias (si no lo hiciste):
    npm --prefix mcpServer install
@@ -126,10 +126,10 @@ Si lo necesitas activo en Claude Code:
 
    Verifica que se haya generado mcpServer/dist/index.js.
 
-3. Revisa que .claude.json tenga la ruta relativa (no absoluta de Windows):
+3. Revisa que la configuración de tu cliente MCP tenga la ruta relativa (no absoluta de Windows):
    "./mcpServer/dist/index.js"
 
-4. Recarga el servidor MCP en Claude Code:
+4. Recarga el servidor MCP en tu cliente:
    Ve a Configuración → MCP Servers → reinicia "gestor-tareas"
 ```
 

@@ -365,8 +365,8 @@ Documento que incluya:
 
 ## 🚀 CÓMO EJECUTAR
 
-1. Copia ESTE PROMPT a Claude Code
-2. Claude Code PRIMERO EVALÚA (no implementa aún)
+1. Copia ESTE PROMPT a un asistente de IA
+2. El asistente PRIMERO EVALÚA (no implementa aún)
 3. Entrega: documento de evaluación + propuesta mejorada
 4. TÚ REVISAS y confirmas cambios
 5. LUEGO: implementación en próxima sesión
@@ -381,7 +381,7 @@ Documento que incluya:
 
 ---
 
-**Copia este prompt completo a Claude Code y pídele que EVALÚE primero, no que implemente.** 🔍
+**Copia este prompt completo a un asistente de IA y pídele que EVALÚE primero, no que implemente.** 🔍
 
 ---
 

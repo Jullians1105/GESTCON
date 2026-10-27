@@ -10,10 +10,6 @@ acumulando la sesión 13 (progreso individual por asignado — checklist #51) m�
 modificados de ambas sesiones. Plan: el usuario va a commitear, pushear la rama (sin abrir PR
 todavía — no hace falta para poder seguir trabajándola en otra máquina, `git fetch` +
 `git checkout` alcanza) y continuar desde un MacBook.  
-**Ojo si se retoma desde otra máquina:** `CLAUDE.md` (raíz) y toda la carpeta `.claude/`
-(incluida esta memoria de sesión) están en `.gitignore` — **no viajan con git push/pull/clone**.
-Si el trabajo continúa en el Mac, ese Claude Code arranca sin este contexto salvo que alguien
-copie esos archivos manualmente (AirDrop/USB/etc.), no vía git.  
 **Versión:** 3.0.0  
 **Fases completadas:** FASE 1 ✅ · FASE 2 ✅ · FASE 3 ✅ · OWASP ✅ · Fondo Emprender ✅  
 **Ramas activas en remoto:** `main` (`feat/funcionesNuevas` ya mergeada vía PR #13 —
@@ -104,7 +100,6 @@ GestionTareasOficina/
 ├── docs/
 │   ├── ESTADO_PROYECTO.md      # Este archivo
 │   ├── PROYECTO.md             # Descripción general del proyecto
-│   ├── CLAUDE.md               # Guía para Claude Code
 │   ├── CAMBIOS_FASE_3.md       # Changelog de FASE 3
 │   ├── CAMBIOS_SESION_2026-06-04.md
 │   ├── CAMBIOS_SESION_2026-06-10.md
